@@ -1,1 +1,10 @@
 opencode.json
+.opencode
+
+checkpoints/*
+datasets/*
+log/*
+LiftQuant/cache/*
+LiftQuant/qmodels/*
+LiftQuant/**/__pycache__/
+LiftQuant/**/*.pyc
