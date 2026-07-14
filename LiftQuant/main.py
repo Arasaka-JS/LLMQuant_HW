@@ -9,6 +9,7 @@ from datautils import get_loaders, get_redpajama
 from lm_eval import evaluator
 from lm_eval.models.huggingface import HFLM
 from lm_eval.utils import make_table
+from eval_gsm8k import evaluate_gsm8k
 from pprint import pprint
 
 import torch.nn as nn
@@ -43,10 +44,46 @@ net_choices = [
 ]
 
 
+def run_lm_eval(lm, args, logger, tasks, num_fewshot, limit, batch_size=8):
+    with torch.amp.autocast(device_type='cuda', dtype=args.dtype):
+        hflm = HFLM(pretrained=lm.model, tokenizer=lm.tokenizer, batch_size=batch_size)
+        results = evaluator.simple_evaluate(
+            hflm,
+            tasks=tasks,
+            num_fewshot=num_fewshot,
+            limit=None if limit == -1 else limit,
+        )
+
+    logger.info(make_table(results))
+
+    metric_vals = {}
+    stderr_vals = {}
+    for task, result in results.get('results', {}).items():
+        metric_key = next(
+            (key for key in ('acc_norm,none', 'acc,none', 'exact_match,strict-match', 'exact_match,flexible-extract') if key in result),
+            None,
+        )
+        if metric_key is None:
+            continue
+        metric_vals[task] = round(result[metric_key], 4)
+        stderr_key = metric_key.replace(',none', '_stderr,none')
+        if stderr_key in result:
+            stderr_vals[task] = round(result[stderr_key], 4)
+
+    if metric_vals:
+        mean_metric_val = round(sum(metric_vals.values()) / len(metric_vals.values()), 4)
+        logger.info(f"lm-eval metrics: {metric_vals}")
+        logger.info(f"lm-eval average: {mean_metric_val}")
+    if stderr_vals:
+        logger.info(f"lm-eval stderr: {stderr_vals}")
+
+    return results
+
+
 @torch.no_grad()
 def evaluate(lm, args, logger):
     results = {}
-    
+
     if "llama" in args.net.lower() or "qwen" in args.net.lower():
         lm.model = lm.model.to(lm.device)
    
@@ -62,6 +99,7 @@ def evaluate(lm, args, logger):
                     seed=args.seed,
                     model=args.model,
                     seqlen=2048,
+                    cache_dir=args.cache_dir,
                 )
                 torch.save(testloader, cache_testloader)
 
@@ -106,29 +144,17 @@ def evaluate(lm, args, logger):
             results[dataset] = ppl.item()
 
     if args.tasks != "":
-        
-        with torch.amp.autocast(device_type='cuda', dtype=args.dtype):
-            hflm = HFLM(pretrained=lm.model, tokenizer=lm.tokenizer,batch_size=8)
-            results = evaluator.simple_evaluate(
-                hflm,
-                tasks=args.tasks.split(','),
-                num_fewshot=args.num_fewshot,
-                limit=None if args.limit == -1 else args.limit,
-            )
+        results['tasks'] = run_lm_eval(
+            lm,
+            args,
+            logger,
+            tasks=args.tasks.split(','),
+            num_fewshot=args.num_fewshot,
+            limit=args.limit,
+        )
 
-        
-        logger.info(make_table(results))
-
-        metric_vals = {task: round(result.get('acc_norm,none', result['acc,none']), 4) for task, result in results['results'].items()}
-        mean_acc_val = round(sum(metric_vals.values()) / len(metric_vals.values()), 4)
-        std_vals = {task: round(result.get('acc_norm_stderr,none', result['acc_stderr,none']), 4) for task, result in results['results'].items()}
-        mean_std_val =round(sum(std_vals.values()) / len(std_vals.values()), 4) 
-        metric_vals['acc_avg'] = mean_acc_val
-        results['results']['AVERAGE'] = {
-            "acc,none":mean_acc_val,
-            "acc_stderr,none":mean_std_val
-        }
-        logger.info(make_table(results))
+    if args.eval_gsm8k:
+        results['gsm8k'] = evaluate_gsm8k(lm, args, logger)
             
     return results
 
@@ -162,7 +188,9 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="Seed for sampling the calibration data.")
     parser.add_argument("--tasks", default="")
     parser.add_argument("--eval_ppl", action="store_true")
+    parser.add_argument("--eval_gsm8k", action="store_true", help="Run GSM8K evaluation with lm-eval.")
     parser.add_argument("--num_fewshot", type=int, default=0)
+    parser.add_argument("--gsm8k_reasoning_capability", type=str, default="no", choices=["yes", "no"], help="Explicitly tell GSM8K whether the model should use reasoning/CoT evaluation.")
     parser.add_argument("--align", type=int, default=-1)
     parser.add_argument("--quant_start", type=int, default=0)
     parser.add_argument("--quant_end", type=int, default=999)
@@ -200,8 +228,6 @@ def main():
     parser.add_argument("--la2_lr", type=float, default=1e-3)
     parser.add_argument("--lt2_lr", type=float, default=1e-3)
     parser.add_argument("--ls_lr", type=float, default=0e-5)
-
-    
 
     parser.add_argument("--wd", type=float, default=0)
 
@@ -304,11 +330,13 @@ def main():
     if args.dtype =="bfloat16":
         args.dtype = torch.bfloat16
 
+    print("Loading model")
     lm = LMClass(args)#初始化一个大模型，包括分词器
-    #pprint(lm.model)
+    pprint(lm.model)
 
     lm.seqlen = args.seqlen#这里又会改变seqlen,这是为什么
     lm.model.eval()
+
     args.hidden_dim = lm.model.config.hidden_size
     args.kv_group = lm.model.config.num_attention_heads // lm.model.config.num_key_value_heads
     args.ffn_dim = lm.model.config.intermediate_size
@@ -344,6 +372,7 @@ def main():
         "quant_bias": args.k_bias,
         "lac":args.lac,
     }
+
     args.R3_quant_params = {
         "n_bits": args.vbits,
         "symmetric": False,
@@ -352,8 +381,6 @@ def main():
         "quant_bias": args.v_bias,
         "lac":args.lac,
     }
-
-
 
     # quantization
     if 'llama-2' in args.net.lower():
@@ -372,6 +399,7 @@ def main():
         args.cache_name = 'qwen3.6'
     elif 'qwen3' in args.net.lower():
         args.cache_name = 'qwen3'
+
 
     if args.pre_eval:
         evaluate(lm, args,logger)
@@ -452,6 +480,7 @@ def main():
                     seed=args.seed,
                     model=args.model,
                     seqlen=lm.seqlen,
+                    cache_dir=args.cache_dir,
                 )
             torch.save(dataloader, cache_dataloader)    
   

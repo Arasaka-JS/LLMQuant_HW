@@ -4,6 +4,11 @@ opencode.json
 checkpoints/*
 datasets/*
 log/*
+
+auto-round_scripts/auto_round_results/
+auto-round_scripts/**/__pycache__/
+auto-round_scripts/**/*.pyc
+
 LiftQuant/cache/*
 LiftQuant/qmodels/*
 LiftQuant/**/__pycache__/

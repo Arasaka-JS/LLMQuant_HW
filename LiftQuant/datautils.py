@@ -1,7 +1,7 @@
 import pdb
 import os
 from transformers import AutoTokenizer
-from datasets import load_dataset
+from datasets import DownloadConfig, load_dataset
 import numpy as np
 import torch
 import random
@@ -10,6 +10,25 @@ import random
 def set_seed(seed):
     np.random.seed(seed)
     torch.random.manual_seed(seed)
+
+
+def get_dataset_cache_dir(name, cache_dir=None):
+    env_var = f"{name.upper()}_CACHE_DIR"
+    env_cache_dir = os.environ.get(env_var)
+    if env_cache_dir and os.path.exists(env_cache_dir):
+        return env_cache_dir, True
+
+    base_cache_dir = cache_dir or os.environ.get("HF_DATASETS_CACHE") or "./cache"
+    cache_path = os.path.join(base_cache_dir, "datasets", name)
+    cache_exists = os.path.exists(cache_path)
+    os.makedirs(cache_path, exist_ok=True)
+    return cache_path, cache_exists
+
+
+def get_download_config(use_local_files):
+    if use_local_files:
+        return DownloadConfig(local_files_only=True)
+    return None
 
 def get_redpajama(nsamples, seed, seqlen, model): 
     print("get_redpajama") 
@@ -56,11 +75,13 @@ def get_pile(nsamples, seed, seqlen, model):
     return trainloader, None
 
 
-def get_wikitext2(nsamples, seed, seqlen, model):
+def get_wikitext2(nsamples, seed, seqlen, model, cache_dir=None):
     print("get_wikitext2")
+    dataset_cache_dir, use_local_files = get_dataset_cache_dir("wikitext2", cache_dir)
+    download_config = get_download_config(use_local_files)
     
-    traindata = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train')
-    testdata = load_dataset('wikitext', 'wikitext-2-raw-v1', split='test')
+    traindata = load_dataset('Salesforce/wikitext', 'wikitext-2-raw-v1', split='train', cache_dir=dataset_cache_dir, download_config=download_config)
+    testdata = load_dataset('Salesforce/wikitext', 'wikitext-2-raw-v1', split='test', cache_dir=dataset_cache_dir, download_config=download_config)
     print("get_wikitext2 over")
 
 
@@ -104,13 +125,15 @@ def get_ptb(nsamples, seed, seqlen, model):
         trainloader.append((inp, tar))
     return trainloader, testenc
 
-def get_c4(nsamples, seed, seqlen, model):
+def get_c4(nsamples, seed, seqlen, model, cache_dir=None):
     print("get_c4")
+    dataset_cache_dir, use_local_files = get_dataset_cache_dir("c4", cache_dir)
+    download_config = get_download_config(use_local_files)
     traindata = load_dataset(
-        'allenai/c4', data_files={'train': 'en/c4-train.00000-of-01024.json.gz'}, split='train'
+        'allenai/c4', data_files={'train': 'en/c4-train.00000-of-01024.json.gz'}, split='train', cache_dir=dataset_cache_dir, download_config=download_config
     )
     valdata = load_dataset(
-        'allenai/c4', data_files={'validation': 'en/c4-validation.00000-of-00008.json.gz'}, split='validation'
+        'allenai/c4', data_files={'validation': 'en/c4-validation.00000-of-00008.json.gz'}, split='validation', cache_dir=dataset_cache_dir, download_config=download_config
     )
 
 
@@ -201,10 +224,10 @@ def get_c4_new(nsamples, seed, seqlen, model):
 
 
 def get_loaders(
-    name, nsamples=128, seed=0, seqlen=2048, model='',
+    name, nsamples=128, seed=0, seqlen=2048, model='', cache_dir=None,
 ):
     if 'wikitext2' in name:
-        return get_wikitext2(nsamples, seed, seqlen, model)
+        return get_wikitext2(nsamples, seed, seqlen, model, cache_dir)
     if 'pile' in name:
         return get_pile(nsamples, seed, seqlen, model)
     if 'ptb' in name:
@@ -214,7 +237,7 @@ def get_loaders(
     if 'c4' in name:
         if 'new' in name:
             return get_c4_new(nsamples, seed, seqlen, model)  
-        return get_c4(nsamples, seed, seqlen, model)
+        return get_c4(nsamples, seed, seqlen, model, cache_dir)
     if 'mix' in name:
         wiki_train,wiki_val=get_wikitext2(nsamples//3, seed, seqlen, model)
         ptb_train,ptb_val=get_ptb(nsamples//3, seed, seqlen, model)

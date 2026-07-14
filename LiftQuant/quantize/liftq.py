@@ -31,7 +31,7 @@ from gptq.modelutils import *
 from gptq.quant import *
 
 from trans_utils import Hadamard_trans, ORTransMatrix, pca_cov, PCA_rotation
-    
+
  
 import torch.nn.functional as F
 
@@ -645,4 +645,3 @@ def liftq(
     gc.collect()                    
     model.config.use_cache = use_cache
     return model
-
