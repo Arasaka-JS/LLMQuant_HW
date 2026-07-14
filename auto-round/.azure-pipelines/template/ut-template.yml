@@ -1,0 +1,131 @@
+parameters:
+  - name: dockerConfigName
+    type: string
+    default: "commonDockerConfig"
+  - name: repo
+    type: string
+    default: "https://github.com/intel/auto-round"
+  - name: utScriptFileName
+    type: string
+  - name: uploadPath
+    type: string
+  - name: utArtifact
+    type: string
+  - name: utTestMode
+    type: string
+    default: "coverage"
+  - name: utContainerName
+    type: string
+    default: "AutoRoundUnitTest"
+  - name: imageSource
+    type: string
+    default: "build"
+  - name: imageName
+    type: string
+    default: "auto-round"
+  - name: imageTag
+    type: string
+    default: "py312"
+  - name: dockerFileName
+    type: string
+    default: "Dockerfile"
+  - name: buildARKWheel
+    type: string
+    default: "false"
+
+
+steps:
+  - template: docker-template.yml
+    parameters:
+      dockerConfigName: ${{ parameters.dockerConfigName }}
+      repoName: ${{ parameters.imageName }}
+      repoTag: ${{ parameters.imageTag }}
+      dockerFileName: ${{ parameters.dockerFileName }}
+      containerName: ${{ parameters.utContainerName }}
+      repo: ${{ parameters.repo }}
+      imageSource: ${{ parameters.imageSource }}
+
+  - task: DownloadPipelineArtifact@2
+    condition: and(succeeded(), eq(variables['BUILD_ARK_WHEEL'], 'true'))
+    inputs:
+      artifact: auto-round-lib-wheel-cp312
+      patterns: '*.whl'
+      path: $(Build.SourcesDirectory)/ark_wheel
+    displayName: "Download ark wheel"
+
+  - ${{ if eq(parameters.imageSource, 'build') }}:
+    - script: |
+        set -eo pipefail
+
+        if [ "${{ parameters.buildARKWheel }}" == "true" ]; then
+          ARK_WHEEL_INSTALL="uv pip install /auto-round/ark_wheel/*.whl --no-deps"
+        else
+          ARK_WHEEL_INSTALL="uv pip install --index-url https://test.pypi.org/simple/ auto-round-lib --pre --no-deps"
+        fi
+
+        if [ "${{ parameters.utScriptFileName }}" == "run_ut_xpu" ];then
+          docker exec ${{ parameters.utContainerName }} bash -c "cd /auto-round \
+            && uv pip install -r .azure-pipelines/scripts/ut/constraints.txt --extra-index-url https://download.pytorch.org/whl/xpu \
+            && uv pip install -r auto_round_extension/ark/requirements.txt \
+            && ${ARK_WHEEL_INSTALL} \
+            && uv pip install -r requirements.txt \
+            && uv pip install -r test/test_ark/requirements.txt \
+            && uv pip install -r test/test_xpu/requirements.txt --extra-index-url https://download.pytorch.org/whl/xpu \
+            && cd /auto-round && uv pip install . \
+            && uv pip list"
+        else 
+          docker exec ${{ parameters.utContainerName }} bash -c "cd /auto-round \
+            && uv pip install -r .azure-pipelines/scripts/ut/constraints.txt --extra-index-url https://download.pytorch.org/whl/cpu \
+            && uv pip install -r auto_round_extension/ark/requirements.txt \
+            && ${ARK_WHEEL_INSTALL} \
+            && uv pip install -r requirements.txt \
+            && uv pip install -r requirements-cpu.txt \
+            && uv pip install -r test/test_cpu/requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu \
+            && uv pip list"
+        fi
+      displayName: "Env Setup"
+
+  - ${{ if eq(parameters.imageSource, 'pull') }}:
+    - script: |
+        set -eo pipefail
+
+        docker exec ${{ parameters.utContainerName }} bash -c "cd /auto-round \
+          && pip install build \
+          && BUILD_HPU_ONLY=1 python -m build \
+          && pip install dist/*.whl \
+          && pip install -r test/test_hpu/requirements.txt \
+          && pip list"
+      displayName: "HPU Env Setup"
+
+  - script: |
+      set -eo pipefail
+
+      docker exec -e NUMA_NODE=${NUMA_NODE} -e NUMA_CPUSET=${NUMA_CPUSET} -e ZE_AFFINITY_MASK=${ZE_AFFINITY_MASK} ${{ parameters.utContainerName }} \
+      bash -c "cd /auto-round/.azure-pipelines/scripts \
+        && bash ut/${{ parameters.utScriptFileName }}.sh ${{ parameters.utTestMode }}"
+    displayName: "Run UT"
+
+  - task: PublishPipelineArtifact@1
+    condition: succeeded()
+    inputs:
+      targetPath: ${{ parameters.uploadPath }}
+      artifact: ${{ parameters.utArtifact }}_coverage
+      publishLocation: "pipeline"
+    displayName: "Publish UT coverage artifact"
+
+  - task: PublishPipelineArtifact@1
+    condition: failed()
+    inputs:
+      targetPath: ${{ parameters.uploadPath }}
+      artifact: "${{ parameters.utArtifact }}-$(System.JobAttempt)"
+      publishLocation: "pipeline"
+    displayName: "Publish UT logs for debugging"
+
+  - task: Bash@3
+    condition: always()
+    inputs:
+      targetType: "inline"
+      script: |
+        docker stop ${{ parameters.utContainerName }}
+        docker rm -vf ${{ parameters.utContainerName }} || true
+    displayName: "Docker clean up"

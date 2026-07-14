@@ -1,0 +1,219 @@
+# AutoRound Environment Variables Configuration
+
+English | [简体中文](./environments_CN.md)
+
+This document describes the environment variables used by AutoRound for configuration and their usage.
+
+## Overview
+
+AutoRound uses a centralized environment variable management system through the `envs.py` module. This system provides lazy evaluation of environment variables and programmatic configuration capabilities.
+
+## Available Environment Variables
+
+### AR_LOG_LEVEL
+- **Description**: Controls the default logging level for AutoRound
+- **Default**: `"INFO"`
+- **Valid Values**: `"TRACE"`,  `"DEBUG"`, `"INFO"`, `"WARNING"`, `"ERROR"`, `"CRITICAL"`
+- **Usage**: Set this to control the verbosity of AutoRound logs
+
+```bash
+export AR_LOG_LEVEL=DEBUG
+```
+
+### AR_ENABLE_COMPILE_PACKING
+- **Description**: Enables compile packing optimization
+- **Default**: `False` (equivalent to `"0"`)
+- **Valid Values**: `"1"`, `"true"`, `"yes"` (case-insensitive) for enabling; any other value for disabling
+- **Usage**: Enable this for performance optimizations during packing FP4 tensors into `uint8`.
+
+```bash
+export AR_ENABLE_COMPILE_PACKING=1
+```
+
+### AR_USE_MODELSCOPE
+- **Description**: Controls whether to use ModelScope for model downloads
+- **Default**: `False`
+- **Valid Values**: `"1"`, `"true"` (case-insensitive) for enabling; any other value for disabling
+- **Usage**: Enable this to use ModelScope instead of Hugging Face Hub for model downloads
+
+```bash
+export AR_USE_MODELSCOPE=true
+```
+
+### AR_WORK_SPACE
+- **Description**: Sets the workspace directory for AutoRound operations
+- **Default**: `"ar_work_space"`
+- **Usage**: Specify a custom directory for AutoRound to store temporary files and outputs
+
+```bash
+export AR_WORK_SPACE=/path/to/custom/workspace
+```
+
+### AR_DISABLE_OFFLOAD
+- **Description**: Forcibly disables the weight offloading feature in `OffloadManager`. Useful during development and debugging to skip all offload/reload overhead.
+- **Default**: `False` (equivalent to `"0"`)
+- **Valid Values**: `"1"`, `"true"`, `"yes"` (case-insensitive) for disabling offload; any other value keeps the default behavior
+- **Usage**: Set this to bypass offloading entirely
+
+```bash
+export AR_DISABLE_OFFLOAD=1
+```
+
+### AR_DISABLE_DATASET_SUBPROCESS
+- **Description**: Only for research. Disables the use of a subprocess for dataset preprocessing. By default, AutoRound uses a subprocess to ensure all temporary memory is reclaimed by the OS.
+- **Default**: `False`
+- **Valid Values**: `"1"`, `"true"` (case-insensitive) for disabling; any other value for enabling
+- **Usage**: Set this to run dataset preprocessing in the main process
+
+```bash
+export AR_DISABLE_DATASET_SUBPROCESS=true
+```
+
+### AR_ACT_SCALE
+- **Description**: Only for research. Controls the scaling factor applied to activation min/max values during activation quantization. A value less than 1.0 shrinks the clipping range, which can reduce outlier impact.
+- **Default**: `1.0`
+- **Valid Values**: float>=0.0, e.g. `0.8`, `0.9`, `1.0`
+- **Usage**: Set this to adjust the activation clipping range
+
+```bash
+export AR_ACT_SCALE=0.9
+```
+
+### AR_ENABLE_ACT_MINMAX_TUNING
+- **Description**: Enables tuning of activation min/max scale parameters (`act_min_scale`, `act_max_scale`) during quantization optimization. When enabled, these scales become tunable instead of remaining fixed at `1.0`.
+- **Default**: `False` (equivalent to `"0"`)
+- **Valid Values**: `"1"`, `"true"`, `"yes"` (case-insensitive) for enabling tuning; any other value keeps tuning disabled
+- **Usage**: Set this to enable activation min-max scale tuning
+
+```bash
+export AR_ENABLE_ACT_MINMAX_TUNING=1
+```
+
+### AR_SEARCH_SCALE_RATIO
+- **Description**: Controls the search range ratio used by the symmetric INT scale search in `auto_round.data_type.int.search_scales`. The search bound is `nmax * AR_SEARCH_SCALE_RATIO`, where `nmax = 2^(bits-1)`. Smaller values restrict the search to a tighter neighborhood around the initial scale (faster, less thorough); larger values broaden the search (slower, may improve accuracy on outlier-heavy weights).
+- **Default**: unset → falls back to the built-in default (`0.5`, i.e. `nmax/2`).
+- **Valid Values**: positive float, e.g. `0.25`, `0.5`, `0.75`, `1.0`
+- **Usage**: Set this to override the default scale-search range
+
+```bash
+export AR_SEARCH_SCALE_RATIO=0.75
+```
+
+### AR_DYNAMO_CACHE_SIZE_LIMIT
+- **Description**: Minimum value to which `torch._dynamo`'s `cache_size_limit`, `accumulated_cache_size_limit`, and `recompile_limit` are bumped when `enable_torch_compile=True`. The same compiled quant function is reused across every linear layer in a transformer block (q/k/v/o_proj, gate/up/down_proj, ...) but each layer has a different weight shape, so per-layer static recompiles quickly exceed dynamo's default limit (8) and trigger a noisy fallback to eager. Raising the limit keeps static-shape compilation (best perf) and just allows more cache entries.
+- **Default**: `16`
+- **Valid Values**: positive integer
+- **Usage**: Increase if your model has more than 16 distinct linear-weight shapes per block (rare).
+
+```bash
+export AR_DYNAMO_CACHE_SIZE_LIMIT=32
+```
+
+### AR_MODEL_FREE_SHARD_PARALLELISM
+- **Description**: Controls how many weight shards are processed concurrently during model-free quantization. Increasing this value improves resource utilization but consumes more RAM.
+  - Auto policy (when the variable is **not** set): `shard_count // 4`, capped at **10**, minimum **1**. For example, 8 shards → 2 workers; 40 shards → 10 workers.
+  - The effective parallelism is always capped to the actual number of shards.
+- **Default**: unset → auto policy applies (`shard_count // 4`, max 10, min 1)
+- **Valid Values**: any positive integer; these are not restricted to specific values — e.g. `2`, `4`, `6`, `8`
+- **Usage**: Set this to override the automatic parallelism selection
+
+```bash
+export AR_MODEL_FREE_SHARD_PARALLELISM=4
+```
+
+### AR_AUTO_SCHEME_NSAMPLES
+- **Description**: Controls the default number of calibration samples used by AutoScheme scoring when `AutoScheme.nsamples` is not explicitly set.
+- **Default**: unset → 16
+- **Valid Values**: any positive integer, e.g. `8`, `16`, `32`
+- **Usage**: Set this to override the automatic sample-count selection for AutoScheme
+
+```bash
+export AR_AUTO_SCHEME_NSAMPLES=1  # set 1 for quick execution
+```
+
+### AR_AUTO_SCHEME_BATCH_SIZE
+- **Description**: Controls the default batch size used by AutoScheme scoring when `AutoScheme.batch_size` is not explicitly set.
+- **Default**: unset → built-in heuristic applies (8 for low GPU memory mode, 1 for normal mode)
+- **Valid Values**: any positive integer, e.g. `1`, `2`, `4`
+- **Usage**: Set this to override the default batch size for AutoScheme
+
+```bash
+export AR_AUTO_SCHEME_BATCH_SIZE=1
+```
+
+## Usage Examples
+
+### Setting Environment Variables
+
+#### Using Shell Commands
+```bash
+# Set logging level to DEBUG
+export AR_LOG_LEVEL=DEBUG
+
+# Enable compile packing
+export AR_ENABLE_COMPILE_PACKING=1
+
+# Use ModelScope for downloads
+export AR_USE_MODELSCOPE=true
+
+# Set custom workspace
+export AR_WORK_SPACE=/tmp/autoround_workspace
+```
+
+#### Using Python Code
+```python
+from auto_round.envs import set_config
+
+# Configure multiple environment variables at once
+set_config(
+    AR_LOG_LEVEL="DEBUG",
+    AR_USE_MODELSCOPE=True,
+    AR_ENABLE_COMPILE_PACKING=True,
+    AR_WORK_SPACE="/tmp/autoround_workspace",
+)
+```
+
+### Checking Environment Variables
+
+#### Using Python Code
+```python
+from auto_round import envs
+
+# Access environment variables (lazy evaluation)
+log_level = envs.AR_LOG_LEVEL
+use_modelscope = envs.AR_USE_MODELSCOPE
+enable_packing = envs.AR_ENABLE_COMPILE_PACKING
+workspace = envs.AR_WORK_SPACE
+
+print(f"Log Level: {log_level}")
+print(f"Use ModelScope: {use_modelscope}")
+print(f"Enable Compile Packing: {enable_packing}")
+print(f"Workspace: {workspace}")
+```
+
+#### Checking if Variables are Explicitly Set
+```python
+from auto_round.envs import is_set
+
+# Check if environment variables are explicitly set
+if is_set("AR_LOG_LEVEL"):
+    print("AR_LOG_LEVEL is explicitly set")
+else:
+    print("AR_LOG_LEVEL is using default value")
+```
+
+## Configuration Best Practices
+
+1. **Development Environment**: Set `AR_LOG_LEVEL=TRACE` or `AR_LOG_LEVEL=DEBUG` for detailed logging during development
+2. **Production Environment**: Use `AR_LOG_LEVEL=WARNING` or `AR_LOG_LEVEL=ERROR` to reduce log noise
+3. **Chinese Users**: Consider setting `AR_USE_MODELSCOPE=true` for better model download performance
+4. **Performance Optimization**: Enable `AR_ENABLE_COMPILE_PACKING=1` if you have sufficient computational resources
+5. **Custom Workspace**: Set `AR_WORK_SPACE` to a directory with sufficient disk space for model processing
+
+## Notes
+
+- Environment variables are evaluated lazily, meaning they are only read when first accessed
+- The `set_config()` function provides a convenient way to configure multiple variables programmatically
+- Boolean values for `AR_USE_MODELSCOPE` are automatically converted to appropriate string representations
+- All environment variable names are case-sensitive
+- Changes made through `set_config()` will affect the current process and any child processes

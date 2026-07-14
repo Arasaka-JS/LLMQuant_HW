@@ -1,0 +1,219 @@
+# AutoRound 环境变量配置
+
+[English](./environments.md) | 简体中文
+
+本文档介绍 AutoRound 使用的环境变量及其配置说明。
+
+## 概述
+
+AutoRound 通过 `envs.py` 模块提供统一的环境变量管理系统，支持懒加载求值与程序化配置。
+
+## 可用环境变量
+
+### AR_LOG_LEVEL
+- **描述**：控制 AutoRound 默认日志级别
+- **默认值**：`"INFO"`
+- **有效值**：`"TRACE"`、`"DEBUG"`、`"INFO"`、`"WARNING"`、`"ERROR"`、`"CRITICAL"`
+- **用途**：通过设置该变量控制 AutoRound 的日志详细程度
+
+```bash
+export AR_LOG_LEVEL=DEBUG
+```
+
+### AR_ENABLE_COMPILE_PACKING
+- **描述**：启用编译打包优化
+- **默认值**：`False`（等价于 `"0"`）
+- **有效值**：`"1"`、`"true"`、`"yes"`（不区分大小写）表示启用；其他值表示禁用
+- **用途**：启用后可在将 FP4 张量打包为 `uint8` 时获得性能优化
+
+```bash
+export AR_ENABLE_COMPILE_PACKING=1
+```
+
+### AR_USE_MODELSCOPE
+- **描述**：控制是否使用 ModelScope 下载模型
+- **默认值**：`False`
+- **有效值**：`"1"`、`"true"`（不区分大小写）表示启用；其他值表示禁用
+- **用途**：启用后将使用 ModelScope 替代 Hugging Face Hub 下载模型
+
+```bash
+export AR_USE_MODELSCOPE=true
+```
+
+### AR_WORK_SPACE
+- **描述**：设置 AutoRound 操作的工作目录
+- **默认值**：`"ar_work_space"`
+- **用途**：指定 AutoRound 存储临时文件和输出结果的自定义目录
+
+```bash
+export AR_WORK_SPACE=/path/to/custom/workspace
+```
+
+### AR_DISABLE_OFFLOAD
+- **描述**：强制禁用 `OffloadManager` 中的权重卸载功能。在开发和调试时可跳过所有卸载/重载开销。
+- **默认值**：`False`（等价于 `"0"`）
+- **有效值**：`"1"`、`"true"`、`"yes"`（不区分大小写）表示禁用卸载；其他值保持默认行为
+- **用途**：设置后将完全绕过权重卸载
+
+```bash
+export AR_DISABLE_OFFLOAD=1
+```
+
+### AR_DISABLE_DATASET_SUBPROCESS
+- **描述**：禁用子进程方式进行数据集预处理。默认情况下，AutoRound 使用子进程确保所有临时内存在进程退出后被操作系统回收。
+- **默认值**：`False`
+- **有效值**：`"1"`、`"true"`（不区分大小写）表示禁用子进程；其他值表示启用子进程
+- **用途**：设置后数据集预处理将在主进程中运行
+
+```bash
+export AR_DISABLE_DATASET_SUBPROCESS=true
+```
+
+### AR_ACT_SCALE
+- **描述**：只用于研究性质，控制激活量化时对激活值最小/最大值的缩放系数。小于 1.0 的值会缩小裁剪范围，有助于减小离群值的影响。
+- **默认值**：`1.0`
+- **有效值**：任意浮点数，如 `0.8`、`0.9`、`1.0`
+- **用途**：调整激活裁剪范围
+
+```bash
+export AR_ACT_SCALE=0.9
+```
+
+### AR_ENABLE_ACT_MINMAX_TUNING 
+- **描述**：只用于研究性质，使用激活量化中最小/最大缩放参数（`act_min_scale`、`act_max_scale`）的调优。启用后，这些缩放参数将固定为 1.0。
+- **默认值**：`False`（等同于 `"0"`）
+- **有效值**：`"1"`、`"true"`、`"yes"`（不区分大小写）表示禁用调优；其他值表示保持调优
+- **用途**：禁用激活最小-最大缩放参数的调优
+
+```bash
+export AR_ENABLE_ACT_MINMAX_TUNING=1
+```
+
+### AR_SEARCH_SCALE_RATIO
+- **描述**：控制 `auto_round.data_type.int.search_scales` 中对称 INT 量化 scale 搜索的范围比例。搜索上界为 `nmax * AR_SEARCH_SCALE_RATIO`，其中 `nmax = 2^(bits-1)`。值越小搜索范围越窄（更快，但可能漏掉较优解）；值越大搜索范围越广（更慢，对离群权重可能更准）。
+- **默认值**：未设置 → 走内置默认值（`0.5`，即 `nmax/2`）。
+- **有效值**：正浮点数，如 `0.25`、`0.5`、`0.75`、`1.0`
+- **用途**：覆盖默认的 scale 搜索范围
+
+```bash
+export AR_SEARCH_SCALE_RATIO=0.75
+```
+
+### AR_DYNAMO_CACHE_SIZE_LIMIT
+- **描述**：在启用 `enable_torch_compile=True` 时，将 `torch._dynamo` 的 `cache_size_limit`、`accumulated_cache_size_limit` 与 `recompile_limit` 提升到的最小值。同一个被编译的量化函数会被 transformer block 内的所有 linear 层（q/k/v/o_proj、gate/up/down_proj 等）复用，但每层权重 shape 不同，按层的静态重编译会很快超过 dynamo 默认上限（8），导致打印告警并退回 eager。提高该上限可以保留静态 shape 编译（性能最佳），仅增加缓存条目数。
+- **默认值**：`16`
+- **有效值**：正整数
+- **用途**：当模型单个 block 内 linear 权重 shape 种类超过 16 时（较少见）可调大。
+
+```bash
+export AR_DYNAMO_CACHE_SIZE_LIMIT=32
+```
+
+### AR_MODEL_FREE_SHARD_PARALLELISM
+- **描述**：控制 model-free 量化时同时处理的权重 shard 数量。增大该值可提高资源利用率，但会占用更多内存。
+  - 自动策略（变量**未设置**时）：`shard_count // 4`，最大 **10**，最小 **1**。例如：8 个 shard → 2 个 worker；40 个 shard → 10 个 worker。
+  - 实际并行数始终不超过 shard 总数。
+- **默认值**：未设置 → 走自动策略（`shard_count // 4`，最大 10，最小 1）
+- **有效值**：任意正整数，不限于特定值，如 `2`、`4`、`6`、`8`；不能整除 shard 数时会自动均匀分配，末批处理剩余 shard，结果正确
+- **用途**：覆盖自动并行策略，手动指定并行数
+
+```bash
+export AR_MODEL_FREE_SHARD_PARALLELISM=4
+```
+
+### AR_AUTO_SCHEME_NSAMPLES
+- **描述**：控制 AutoScheme 评分时使用的校准样本数默认值，仅在 `AutoScheme.nsamples` 未显式设置时生效。
+- **默认值**：未设置 → 16
+- **有效值**：任意正整数，如 `8`、`16`、`32`
+- **用途**：覆盖 AutoScheme 的自动样本数选择
+
+```bash
+export AR_AUTO_SCHEME_NSAMPLES=1
+```
+
+### AR_AUTO_SCHEME_BATCH_SIZE
+- **描述**：控制 AutoScheme 评分时使用的批大小默认值，仅在 `AutoScheme.batch_size` 未显式设置时生效。
+- **默认值**：未设置 → 走内置启发式规则（低GPU内存模式为 8，普通模式为 1）
+- **有效值**：任意正整数，如 `1`、`2`、`4`
+- **用途**：覆盖 AutoScheme 的默认批大小
+
+```bash
+export AR_AUTO_SCHEME_BATCH_SIZE=1
+```
+
+## 使用示例
+
+### 设置环境变量
+
+#### 通过 Shell 命令
+```bash
+# 将日志级别设置为 DEBUG
+export AR_LOG_LEVEL=DEBUG
+
+# 启用编译打包
+export AR_ENABLE_COMPILE_PACKING=1
+
+# 使用 ModelScope 下载模型
+export AR_USE_MODELSCOPE=true
+
+# 设置自定义工作目录
+export AR_WORK_SPACE=/tmp/autoround_workspace
+```
+
+#### 通过 Python 代码
+```python
+from auto_round.envs import set_config
+
+# 同时配置多个环境变量
+set_config(
+    AR_LOG_LEVEL="DEBUG",
+    AR_USE_MODELSCOPE=True,
+    AR_ENABLE_COMPILE_PACKING=True,
+    AR_WORK_SPACE="/tmp/autoround_workspace",
+)
+```
+
+### 查看环境变量
+
+#### 通过 Python 代码
+```python
+from auto_round import envs
+
+# 访问环境变量（懒加载求值）
+log_level = envs.AR_LOG_LEVEL
+use_modelscope = envs.AR_USE_MODELSCOPE
+enable_packing = envs.AR_ENABLE_COMPILE_PACKING
+workspace = envs.AR_WORK_SPACE
+
+print(f"日志级别: {log_level}")
+print(f"使用 ModelScope: {use_modelscope}")
+print(f"启用编译打包: {enable_packing}")
+print(f"工作目录: {workspace}")
+```
+
+#### 检查变量是否显式设置
+```python
+from auto_round.envs import is_set
+
+# 检查环境变量是否被显式设置
+if is_set("AR_LOG_LEVEL"):
+    print("AR_LOG_LEVEL 已被显式设置")
+else:
+    print("AR_LOG_LEVEL 正在使用默认值")
+```
+
+## 配置最佳实践
+
+1. **开发环境**：设置 `AR_LOG_LEVEL=TRACE` 或 `AR_LOG_LEVEL=DEBUG` 以获取详细日志
+2. **生产环境**：使用 `AR_LOG_LEVEL=WARNING` 或 `AR_LOG_LEVEL=ERROR` 减少日志噪声
+3. **中国用户**：建议设置 `AR_USE_MODELSCOPE=true` 以获得更好的模型下载速度
+4. **性能优化**：如有足够算力，可启用 `AR_ENABLE_COMPILE_PACKING=1`
+5. **自定义工作目录**：将 `AR_WORK_SPACE` 设置为磁盘空间充足的目录
+
+## 注意事项
+
+- 环境变量采用懒加载方式，仅在首次访问时读取
+- `set_config()` 函数提供了便捷的程序化多变量配置方式
+- `AR_USE_MODELSCOPE` 的布尔值会自动转换为适当的字符串表示
+- 所有环境变量名称区分大小写
+- 通过 `set_config()` 所做的修改将影响当前进程及其子进程
