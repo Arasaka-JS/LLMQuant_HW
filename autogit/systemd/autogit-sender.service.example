@@ -1,0 +1,22 @@
+[Unit]
+Description=autogit sender worktree snapshot service
+Documentation=file:/opt/autogit/readme.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+# Change these to the ordinary user that owns the repository and sender SSH key.
+User=CHANGE_ME
+Group=CHANGE_ME
+EnvironmentFile=/etc/autogit-sender.env
+ExecStart=/opt/autogit/sender.sh
+Restart=always
+RestartSec=5s
+TimeoutStopSec=30s
+WorkingDirectory=/
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

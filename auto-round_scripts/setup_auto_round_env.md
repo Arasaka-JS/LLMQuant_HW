@@ -166,3 +166,41 @@ If CUDA is expected but unavailable, verify PyTorch first:
 ```bash
 python -c "import torch; print(torch.__version__); print(torch.cuda.is_available())"
 ```
+
+## 7. Offline lm-eval Evaluation
+
+Prepare the evaluation datasets in a dedicated local directory using ModelScope mirrors:
+
+```bash
+python /home/kris/workspace/sunkaiwei/Quant/LLMQuant_HW/auto-round_scripts/prepare_lm_eval_datasets.py \
+  --data-dir /home/kris/workspace/sunkaiwei/Quant/LLMQuant_HW/datasets
+```
+
+This prepares MMLU, LAMBADA OpenAI, HellaSwag, WinoGrande, PIQA, TruthfulQA MC1/MC2, OpenBookQA, BoolQ, RTE, ARC-Easy, and ARC-Challenge. The script resolves tasks through the installed lm-eval version so all required configurations and splits are cached.
+
+The raw snapshots are stored directly as `datasets/mmlu/`, `datasets/hellaswag/`, `datasets/piqa/`, and other dataset-named directories. Generated lm-eval caches are kept separately under `datasets/.lm_eval_cache/`.
+
+- `https://modelscope.cn/datasets/cais/mmlu`
+- `https://modelscope.cn/datasets/EleutherAI/lambada_openai`
+- `https://modelscope.cn/datasets/allenai/hellaswag`
+- `https://modelscope.cn/datasets/allenai/winogrande`
+- `https://modelscope.cn/datasets/vikhyatk/piqa`
+- `https://modelscope.cn/datasets/evalscope/truthful_qa`
+- `https://modelscope.cn/datasets/allenai/openbookqa`
+- `https://modelscope.cn/datasets/google/boolq`
+- `https://modelscope.cn/datasets/nyu-mll/glue`
+- `https://modelscope.cn/datasets/allenai/ai2_arc`
+
+Run a small offline smoke evaluation first:
+
+```bash
+python /home/kris/workspace/sunkaiwei/Quant/LLMQuant_HW/auto-round_scripts/eval_autoround.py \
+  --model /home/kris/workspace/sunkaiwei/Quant/LLMQuant_HW/auto-round_scripts/auto_round_results/Qwen3-4B-w4g128 \
+  --data-dir /home/kris/workspace/sunkaiwei/Quant/LLMQuant_HW/datasets \
+  --device cuda:0 \
+  --batch-size auto:8 \
+  --limit 2 \
+  --bootstrap-iters 0
+```
+
+Remove `--limit 2` and `--bootstrap-iters 0` for the full evaluation. Evaluation always runs offline and fails if a required local snapshot is missing. JSON results are written under `auto-round_scripts/eval_results/`.

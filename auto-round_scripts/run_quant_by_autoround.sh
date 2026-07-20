@@ -3,7 +3,7 @@ set -euo pipefail
 
 PROJECT_ROOT="/home/kris/workspace/sunkaiwei/Quant/LLMQuant_HW"
 MODEL_PATH="${MODEL_PATH:-${PROJECT_ROOT}/checkpoints/Qwen/Qwen3-4B}"
-OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_ROOT}/auto-round_scripts/auto_round_results}"
+OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_ROOT}/checkpoints/results}"
 
 # Pass a local .json/.jsonl calibration file as the first argument, or set CALIB_DATASET.
 # AutoRound local calibration input must be a JSON/JSONL file, not the downloaded parquet directory.

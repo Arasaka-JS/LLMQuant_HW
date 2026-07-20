@@ -1,0 +1,22 @@
+[Unit]
+Description=autogit receiver forced mirror service
+Documentation=file:/opt/autogit/readme.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+# Change these to the ordinary user that owns the repository and read-only SSH key.
+User=CHANGE_ME
+Group=CHANGE_ME
+EnvironmentFile=/etc/autogit-receiver.env
+ExecStart=/opt/autogit/receiver.sh
+Restart=always
+RestartSec=5s
+TimeoutStopSec=30s
+WorkingDirectory=/
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

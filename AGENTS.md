@@ -18,3 +18,6 @@
 - `e2efinetune.py` imports `datautils_block`, but that file is not present in this checkout; verify or add the missing module before running e2e fine-tuning.
 - Dataset helpers contain hard-coded cache locations such as `/mnt/bn/.../redpajama_cache` and `/data/shared_data/datasets`; update these deliberately if running outside that environment.
 - `main.py` writes logs to `../log/` by default and dataset/model caches under `./cache`; keep generated artifacts out of source changes unless explicitly requested.
+
+## Notice 
+如果你要更改auto-round源码，必须征得同意
