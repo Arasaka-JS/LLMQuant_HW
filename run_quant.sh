@@ -4,13 +4,15 @@ set -euo pipefail
 PROJECT_ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$PROJECT_ROOT/LiftQuant"
 
-export REDPAJAMA_CACHE_DIR=/home/kris/workspace/sunkaiwei/Quant/LLMQuant_HW/datasets/redpajama_cache
-export WIKITEXT2_CACHE_DIR=/home/kris/workspace/sunkaiwei/Quant/LLMQuant_HW/datasets/wikitext2_cache
-export C4_CACHE_DIR=/home/kris/workspace/sunkaiwei/Quant/LLMQuant_HW/datasets/c4_cache
-export GSM8K_CACHE_DIR=/home/kris/workspace/sunkaiwei/Quant/LLMQuant_HW/datasets/gsm8k_cache
-export MODEL_PATH=/home/kris/workspace/sunkaiwei/Quant/LLMQuant_HW/checkpoints/meta-llama/Llama-2-7b-hf
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-2}
+export REDPAJAMA_CACHE_DIR="${PROJECT_ROOT}/datasets/redpajama_cache"
+export WIKITEXT2_CACHE_DIR="${PROJECT_ROOT}/datasets/wikitext2_cache"
+export C4_CACHE_DIR="${PROJECT_ROOT}/datasets/c4_cache"
+export GSM8K_CACHE_DIR="${PROJECT_ROOT}/datasets/gsm8k_cache"
+export MODEL_PATH="${PROJECT_ROOT}/checkpoints/Qwen/Qwen3-4B"
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
 export EVAL_GSM8K=${EVAL_GSM8K:-0}
+export FULL_FINTUNE=${FULL_FINTUNE:-0}
 export GSM8K_REASONING_CAPABILITY=${GSM8K_REASONING_CAPABILITY:-no}
 
 ARGS=(
@@ -18,7 +20,7 @@ ARGS=(
     --save_dir ./qmodels
     --eval_ppl
     --wbits 2
-    --expc 20to8
+    --expc 24to8
     --w_sym
     --abits 16
     --kbits 16
@@ -35,7 +37,6 @@ ARGS=(
     --calib_dataset redpajama
     --usefullfp
     --training_trans
-    --finetuning_weights
     --align 1
     --lscale_lr 5e-3
     --lexw_lr 2e-2
@@ -53,4 +54,10 @@ if [[ "$EVAL_GSM8K" == "1" ]]; then
     )
 fi
 
-python main.py "${ARGS[@]}" "$@"
+if [[ "$FULL_FINTUNE" == "1" ]]; then
+    ARGS+=(
+        --finetuning_weights
+    )
+fi
+
+CUDA_VISIBLE_DEVICES=0 python main.py "${ARGS[@]}" "$@"

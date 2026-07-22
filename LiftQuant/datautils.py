@@ -33,7 +33,21 @@ def get_download_config(use_local_files):
 def get_redpajama(nsamples, seed, seqlen, model): 
     print("get_redpajama") 
     #traindata = load_dataset("togethercomputer/RedPajama-Data-1T-Sample", cache_dir = "../dataset/RedPajama-1T-Sample",split='train')  
-    traindata = load_dataset("ZengXiangyu/RedPajama-Data-1T-Sample", cache_dir = os.environ.get("REDPAJAMA_CACHE_DIR"),split='train')  
+    redpajama_cache_dir = os.environ.get("REDPAJAMA_CACHE_DIR")
+    if redpajama_cache_dir and not os.path.exists(redpajama_cache_dir):
+        raise FileNotFoundError(f"REDPAJAMA_CACHE_DIR does not exist: {redpajama_cache_dir}")
+    dataset_cache_dir, use_local_files = get_dataset_cache_dir(
+        "redpajama",
+        redpajama_cache_dir,
+    )
+    download_config = get_download_config(use_local_files)
+    print(f"RedPajama cache: {dataset_cache_dir} (local_files_only={use_local_files})")
+    traindata = load_dataset(
+        "ZengXiangyu/RedPajama-Data-1T-Sample",
+        cache_dir=dataset_cache_dir,
+        split='train',
+        download_config=download_config,
+    )  
     tokenizer = AutoTokenizer.from_pretrained(model, use_fast=False)
     
     random.seed(seed)

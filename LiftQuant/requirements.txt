@@ -1,7 +1,7 @@
 transformers==5.9.0
-lm-eval==0.4.11
-accelerate
-torch==2.6.0
+# lm-eval==0.4.11
+# accelerate
+# torch==2.6.0
 bitblas==0.1.0.post1
 matplotlib
 termcolor

@@ -5,6 +5,21 @@ from tqdm import tqdm
 import gc  
 from quantize.tmplinear import TmpLinear, FWTLinear
 
+
+def resolve_torch_dtype(dtype):
+    if dtype in (None, "auto"):
+        return None
+    if isinstance(dtype, torch.dtype):
+        return dtype
+    dtype_map = {
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "float32": torch.float32,
+    }
+    if dtype not in dtype_map:
+        raise ValueError(f"Unsupported dtype: {dtype}")
+    return dtype_map[dtype]
+
 def get_named_linears(module, type):
     # return {name: m for name, m in module.named_modules() if isinstance(m, torch.nn.Linear)}
     return {name: m for name, m in module.named_modules() if isinstance(m, type)}
@@ -59,7 +74,7 @@ def check_meta_tensors(model, context: str = "当前状态"):
 
     return found_meta_tensor
 
-def load_quantized_model(fp_model_path, quant_model_path, wbits, expc, w_ternary, load_per_layer, auto_mix_precision = False):
+def load_quantized_model(fp_model_path, quant_model_path, wbits, expc, w_ternary, load_per_layer, auto_mix_precision = False, eval_dtype = "float32"):
     print(f"Loading quantized model from {fp_model_path}")
 
     # import pdb;pdb.set_trace()
@@ -184,7 +199,12 @@ def load_quantized_model(fp_model_path, quant_model_path, wbits, expc, w_ternary
     model = dispatch_model(model, device_map=device_map)
     print("Loaded quantized weights successfully.")
 
-    model = model.to(torch.float)
+    target_dtype = resolve_torch_dtype(eval_dtype)
+    # Evaluation should follow the same dtype choice as eval_by_lmeval.sh: the
+    # caller passes float16/bfloat16/float32, while "auto" keeps the checkpoint
+    # dtypes instead of forcing the LiftQuant model to float32.
+    if target_dtype is not None:
+        model = model.to(target_dtype)
     #load_checkpoint_in_model(model,checkpoint=model_path,device_map=device_map,offload_state_dict=True)
     #print("Loading pre-computed quantized weights Successfully")
     #print(model.model.layers[0].mlp.up_proj.Trans.linear_u_left.dtype)

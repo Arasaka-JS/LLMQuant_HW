@@ -10,6 +10,9 @@ auto-round_scripts/eval_results/
 auto-round_scripts/**/__pycache__/
 auto-round_scripts/**/*.pyc
 
+allq/**/__pycache__/
+allq/**/*.pyc
+
 LiftQuant/cache/*
 LiftQuant/qmodels/*
 LiftQuant/**/__pycache__/
