@@ -13,14 +13,23 @@ EVAL_SCRIPT="${PROJECT_ROOT}/allq/scripts/eval_by_lmeval.sh"
 # EVAL_BS=16 \
 # "${EVAL_SCRIPT}"
 
-# Demo 2: evaluate a LiftQuant quantized model on multiple tasks.
-CUDA_DEVICE=2 \
-EVAL_BACKEND=liftquant \
-FP_MODEL_PATH="${PROJECT_ROOT}/checkpoints/Qwen/Qwen3-4B" \
-QUANT_MODEL_PATH="${PROJECT_ROOT}/LiftQuant/qmodels/Qwen3-4B/Qwen3-4B+24to8-packed.pth" \
-TASKS=hellaswag,piqa,winogrande \
+# Demo 2: evaluate an original floating-point Hugging Face model on multiple tasks.
+CUDA_DEVICE=6 \
+EVAL_BACKEND=fp \
+MODEL_PATH="${PROJECT_ROOT}/checkpoints/Qwen/Qwen3-4B" \
+TASKS=all \
 EVAL_DTYPE=bfloat16 \
 EVAL_BS=16 \
-LIFTQUANT_WBITS=2 \
-LIFTQUANT_EXPC=24to8 \
 "${EVAL_SCRIPT}"
+
+# # Demo 3: evaluate a LiftQuant quantized model on multiple tasks.
+# CUDA_DEVICE=2 \
+# EVAL_BACKEND=liftquant \
+# FP_MODEL_PATH="${PROJECT_ROOT}/checkpoints/Qwen/Qwen3-4B" \
+# QUANT_MODEL_PATH="${PROJECT_ROOT}/LiftQuant/qmodels/Qwen3-4B/Qwen3-4B+24to8-packed.pth" \
+# TASKS=hellaswag,piqa,winogrande \
+# EVAL_DTYPE=bfloat16 \
+# EVAL_BS=16 \
+# LIFTQUANT_WBITS=2 \
+# LIFTQUANT_EXPC=24to8 \
+# "${EVAL_SCRIPT}"

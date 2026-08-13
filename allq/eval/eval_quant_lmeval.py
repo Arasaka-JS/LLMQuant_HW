@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate AutoRound or LiftQuant quantized models with lm-eval using local datasets only."""
+"""Evaluate AutoRound, LiftQuant, or floating-point models with lm-eval using local datasets only."""
 
 import argparse
 import json
@@ -70,7 +70,7 @@ def number(value: str) -> int | float:
 def parse_args() -> argparse.Namespace:
     root = project_root()
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--backend", choices=("autoround", "liftquant"), default="autoround")
+    parser.add_argument("--backend", choices=("autoround", "liftquant", "fp"), default="autoround")
     parser.add_argument(
         "--model",
         type=Path,
@@ -201,7 +201,7 @@ def print_summary(summary: list[dict[str, Any]]) -> None:
         print(f"{row['task']:<22} {'  '.join(values)}")
 
 
-def build_autoround_lm(args: argparse.Namespace):
+def build_hf_lm(args: argparse.Namespace):
     from lm_eval.models.huggingface import HFLM
 
     return HFLM(
@@ -281,10 +281,10 @@ def merge_lm_eval_results(results_by_task: list[dict[str, Any]]) -> dict[str, An
 def run_evaluation(args: argparse.Namespace, tasks: list[str]) -> dict[str, Any]:
     from lm_eval.utils import make_table
 
-    if args.backend == "autoround":
-        lm_eval_model = build_autoround_lm(args)
-    else:
+    if args.backend == "liftquant":
         lm_eval_model = build_liftquant_lm(args)
+    else:
+        lm_eval_model = build_hf_lm(args)
 
     if not args.task_by_task:
         results = evaluate_lm(args, lm_eval_model, tasks)
@@ -320,11 +320,13 @@ def main() -> None:
     tasks = args.tasks
 
     manifest = validate_common(data_dir)
-    if args.backend == "autoround":
-        validate_hf_model_dir(args.model, "AutoRound model directory")
-    else:
+    if args.backend == "liftquant":
         validate_hf_model_dir(args.fp_model_path, "FP model directory")
         validate_liftquant_checkpoint(args.quant_model_path, args.load_per_layer)
+    elif args.backend == "fp":
+        validate_hf_model_dir(args.model, "FP model directory")
+    else:
+        validate_hf_model_dir(args.model, "AutoRound model directory")
 
     configure_huggingface_cache(data_dir)
 
@@ -332,6 +334,8 @@ def main() -> None:
     print(f"Using local datasets from: {data_dir}")
     if args.backend == "autoround":
         print(f"AutoRound model: {args.model}")
+    elif args.backend == "fp":
+        print(f"FP model: {args.model}")
     else:
         print(f"FP model: {args.fp_model_path}")
         print(f"LiftQuant checkpoint: {args.quant_model_path}")
@@ -358,7 +362,7 @@ def main() -> None:
         "run": {
             "created_at": datetime.now(timezone.utc).isoformat(),
             "backend": args.backend,
-            "model": str(args.model) if args.backend == "autoround" else None,
+            "model": str(args.model) if args.backend in ("autoround", "fp") else None,
             "fp_model": str(args.fp_model_path) if args.backend == "liftquant" else None,
             "quant_model": str(args.quant_model_path) if args.backend == "liftquant" else None,
             "data_dir": str(data_dir),

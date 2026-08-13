@@ -12,7 +12,7 @@ export MODEL_PATH="${PROJECT_ROOT}/checkpoints/Qwen/Qwen3-4B"
 export HF_HUB_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
 export EVAL_GSM8K=${EVAL_GSM8K:-0}
-export FULL_FINTUNE=${FULL_FINTUNE:-0}
+export FULL_FINTUNE=${FULL_FINTUNE:-1}
 export GSM8K_REASONING_CAPABILITY=${GSM8K_REASONING_CAPABILITY:-no}
 
 ARGS=(
@@ -20,7 +20,7 @@ ARGS=(
     --save_dir ./qmodels
     --eval_ppl
     --wbits 2
-    --expc 24to8
+    --expc 16to8
     --w_sym
     --abits 16
     --kbits 16
@@ -33,7 +33,7 @@ ARGS=(
     --nsamples2 4096
     --epochs1 2
     --epochs2 2
-    --batch_size 2
+    --batch_size 4
     --calib_dataset redpajama
     --usefullfp
     --training_trans
@@ -45,6 +45,7 @@ ARGS=(
     --lt_lr 2e-4
     # --only_eval
     --load_dir ""
+    --fast_nearest
 )
 
 if [[ "$EVAL_GSM8K" == "1" ]]; then
@@ -60,4 +61,8 @@ if [[ "$FULL_FINTUNE" == "1" ]]; then
     )
 fi
 
-CUDA_VISIBLE_DEVICES=0 python main.py "${ARGS[@]}" "$@"
+# Demo 1: single GPU. Do not pass --quant_training_ddp so Stage1/Stage2 use the single-process path.
+CUDA_VISIBLE_DEVICES=0 torchrun --standalone --nproc_per_node=1 main.py "${ARGS[@]}" "$@"
+
+# Demo 2: multi GPU. Uncomment this line and comment out Demo 1 to enable Stage1/Stage2 DDP.
+# CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node=4 main.py "${ARGS[@]}" --quant_training_ddp "$@"

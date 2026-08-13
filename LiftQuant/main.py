@@ -14,6 +14,12 @@ from pprint import pprint
 
 import torch.nn as nn
 from quantize.liftq import liftq
+from quantize.stage_training import (
+    destroy_training_ddp_if_needed,
+    init_training_ddp_if_needed,
+    training_ddp_worker_loop,
+    stop_training_ddp_workers,
+)
 from tqdm import tqdm
 import utils
 from pathlib import Path
@@ -274,6 +280,7 @@ def main():
     parser.add_argument("--limit", type=int, default=-1)
 
     parser.add_argument("--deactive_amp", action="store_true", help="deactivate AMP when 8<=bits<16")
+    parser.add_argument("--quant_training_ddp", default=False, action="store_true", help="Use DDP for quantization training. Launch with torchrun.")
     parser.add_argument(
         "--attn_implementation",
         type=str, required=False, default="eager",
@@ -298,6 +305,8 @@ def main():
     parser.add_argument( '--info', action='store_true', help='Show info')
     
     args = parser.parse_args()
+    init_training_ddp_if_needed(args)
+
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -329,6 +338,11 @@ def main():
         args.dtype = torch.float16
     if args.dtype =="bfloat16":
         args.dtype = torch.bfloat16
+
+    if args.quant_training_ddp and args.distributed_rank != 0:
+        training_ddp_worker_loop(args)
+        destroy_training_ddp_if_needed(args)
+        return
 
     print("Loading model")
     lm = LMClass(args)#初始化一个大模型，包括分词器
@@ -485,12 +499,15 @@ def main():
             torch.save(dataloader, cache_dataloader)    
   
         
-        liftq(
-            lm,
-            args,
-            dataloader,
-            logger,
-        )
+        try:
+            liftq(
+                lm,
+                args,
+                dataloader,
+                logger,
+            )
+        finally:
+            stop_training_ddp_workers(args)
 
         logger.info(time.time() - tick)
 
@@ -503,8 +520,11 @@ def main():
             print(f"Quantized model has been saved to：{save_path}")
         else:
             print("Haven't set save_dir")
+    else:
+        stop_training_ddp_workers(args)
 
     evaluate(lm, args,logger)
+    destroy_training_ddp_if_needed(args)
 
 if __name__ == "__main__":
     # print(sys.argv)

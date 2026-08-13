@@ -4,8 +4,8 @@ set -euo pipefail
 PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 
 EVAL_BACKEND="${EVAL_BACKEND:-autoround}"
-if [[ "${EVAL_BACKEND}" != "autoround" && "${EVAL_BACKEND}" != "liftquant" ]]; then
-  printf 'Unsupported EVAL_BACKEND: %s (expected autoround or liftquant)\n' "${EVAL_BACKEND}" >&2
+if [[ "${EVAL_BACKEND}" != "autoround" && "${EVAL_BACKEND}" != "liftquant" && "${EVAL_BACKEND}" != "fp" ]]; then
+  printf 'Unsupported EVAL_BACKEND: %s (expected autoround, liftquant, or fp)\n' "${EVAL_BACKEND}" >&2
   exit 1
 fi
 

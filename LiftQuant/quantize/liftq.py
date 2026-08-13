@@ -3,7 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from models.int_llama_layer import QuantLlamaDecoderLayer
 from quantize.tmplinear import *
-from contextlib import nullcontext
 import copy
 import math
 import utils
@@ -11,6 +10,7 @@ import os
 import pdb
 import gc
 from quantize.utils import  get_parameters, get_act_means
+from quantize.stage_training import null_traincast, run_stage1_training, run_stage2_training
 
 
 from tqdm import tqdm
@@ -77,6 +77,7 @@ def print_trainable_parameters(model):
         f"trainable: {100 * trainable_params / all_param}"
     )
 
+
 def liftq(
     lm,
     args,
@@ -139,7 +140,7 @@ def liftq(
     # args.deactive_amp = False args.epochs1=1
     if args.deactive_amp and args.epochs1>0:
         dtype = torch.float
-        traincast = nullcontext
+        traincast = null_traincast
     else:
         dtype = args.dtype
         traincast = torch.amp.autocast
@@ -382,114 +383,22 @@ def liftq(
             
             ###############################################################  
             #Stage1: training transformation
-            wq_alpha = []
-            scale_list0 = []
-            scale_list1 = []
-            scale_list2 = []
-            w_list = []
-            
-            for n,m in qlayer.named_modules():
-                if isinstance(m, TmpLinear):
-                    m.input_trans = True
-                    #m.output_trans = True
-                    #if 'o_proj' in n or 'down_proj':
-                    #    m.output_trans = True
-                    
-                    m.find_params()
-                    m.quantizer.register_parameter('alpha', nn.Parameter(0.*torch.ones(m.quantizer.scale.shape, device = m.orilinear.weight.device , dtype = m.orilinear.weight.dtype )))
-                    #print(m.quantizer.alpha.device)
-                    wq_alpha += [m.quantizer.alpha]
-                    #scale_list1 += [ m.a3, m.a2]
-                    scale_list1 += [ m.a2]
-                    scale_list2 +=  [m.a1]
-                    w_list += [m.orilinear.weight]
-                
-            scale_list0 += get_n_set_parameters_byname(qlayer, ["Trans.linear", ])
-            if args.transmask[0] == '1':
-                lrscale0 = args.lscale_lr
-            else:
-                lrscale0 = 0.
-            if args.transmask[1] == '1':
-                lrscale1 = args.lscale_lr
-            else:
-                lrscale1 = 0.
-            if args.transmask[2] == '1':
-                lrscale2 = 2*args.lscale_lr
-            else:
-                lrscale2 = 0.
-            if args.transmask[3] == '1':
-                optimizer = torch.optim.AdamW(
-                    [{"params":wq_alpha,"lr":args.lwc_lr}, {"params":w_list,"lr":args.lw_lr},  {"params":scale_list0,"lr":lrscale0}, {"params":scale_list1,"lr":lrscale1}, {"params":scale_list2,"lr":lrscale2}],  weight_decay=args.wd)
-                
-            else:
-                optimizer = torch.optim.AdamW(
-                    [{"params":wq_alpha,"lr":args.lwc_lr},  {"params":scale_list0,"lr":lrscale0}, {"params":scale_list1,"lr":lrscale1}, {"params":scale_list2,"lr":lrscale2}],  weight_decay=args.wd)
-                print(args.lwc_lr,lrscale0,lrscale1,lrscale2)
-
-            epochs = args.epochs1
             if args.nsamples1 == args.nsamples:
                 args.nsamples1 = args.nsamples1 - args.nsamples//32
-            #scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max = epochs * (args.nsamples1// args.batch_size), eta_min=args.lscale_lr * 1e-2)
-            empty_optimizer_list = [torch.optim.AdamW([torch.tensor(0)], lr=optimizer.param_groups[k]['lr']) for k in range(len(optimizer.param_groups))]
-            scheduler_list = [torch.optim.lr_scheduler.CosineAnnealingLR(empty_optimizer_list[k], T_max=epochs * (args.nsamples1// args.batch_size), eta_min = optimizer.param_groups[k]['lr']/20) for k in range(len(optimizer.param_groups))]
-            loss_scaler = utils.NativeScalerWithGradNormCount() 
-            with torch.no_grad():  
-                for n,m in qlayer.named_modules():
-                    if isinstance(m, TmpLinear):
-                        m.quant_tmpweight()
-            
-            for epoch in range(epochs):
-                loss_list = []
-                norm_list = []
-                for j in range(args.nsamples1//args.batch_size): 
-                    index = j * args.batch_size 
-                    with traincast(device_type='cuda',dtype=args.dtype):
-                        for n,m in qlayer.named_modules():
-                            if isinstance(m, TmpLinear):
-                                m.quant_tmpweight()
-                                m.showflag = False
-                        quant_out = qlayer(quant_inps[index:index+args.batch_size,].to(dev), attention_mask=attention_mask_batch,position_embeddings=position_embeddings)
-                        loss = loss_func(fp_outs[index:index+args.batch_size,].to(dev), quant_out)
-                        
-                    if not math.isfinite(loss.item()):
-                        logger.info("Loss is NAN, stopping training")
-                        non_finite_mask_inp = ~torch.isfinite(quant_inps[index:index+args.batch_size,])
-                        non_finite_mask_qout = ~torch.isfinite(quant_out)
-                        non_finite_mask_fpout = ~torch.isfinite(fp_outs[index:index+args.batch_size,])
-                        indices_inp = torch.nonzero(non_finite_mask_inp)
-                        indices_qout = torch.nonzero(non_finite_mask_qout)
-                        indices_fpout = torch.nonzero(non_finite_mask_fpout)
-        
-                        if indices_inp.numel() > 0:
-                            for idex in indices_inp:
-                                 print(f" input- 索引: {idex.tolist()}, 值为: {quant_inps[index:index+args.batch_size,][tuple(idex)]}")
-                        if indices_qout.numel() > 0:
-                            for idex in indices_qout:
-                                 print(f" qoutput- 索引: {idex.tolist()}, 值为: {quant_out[tuple(idex)]}")
-                        if indices_fpout.numel() > 0:
-                            for idex in indices_fpout:
-                                 print(f" fpout- 索引: {idex.tolist()}, 值为: {fp_outs[index:index+args.batch_size,][tuple(idex)]}")
-                    else:  
-                        optimizer.zero_grad()  
-                        loss_list.append(loss.detach().cpu())
-                        norm = loss_scaler(loss, optimizer,parameters= get_parameters(qlayer)).cpu()
-                        #scheduler.step()
-                        for k in range(len(optimizer.param_groups)):
-                            scheduler_list[k].step()
-                            optimizer.param_groups[k]['lr'] = scheduler_list[k].get_lr()[0]
-                        norm_list.append(norm.data)
-                    
-                    if j%128 == 127:
-                        loss_mean = torch.stack(loss_list).mean()
-                        norm_mean = torch.stack(norm_list).mean()
-                        logger.info(f"layer {i} batchs {j} loss:{loss_mean} norm:{norm_mean} max memory_allocated {torch.cuda.max_memory_allocated(lm._device) / 1024**2} ")
-                        loss_list = []
-                        norm_list = []
-                        
-                        #print((qlayer.mlp.up_proj.a2))
-                        #print((qlayer.mlp.up_proj.Trans.linear_diag_left))
-            optimizer.zero_grad()
-            del wq_alpha, w_list, scale_list1, scale_list2, optimizer
+            qlayer = run_stage1_training(
+                qlayer,
+                args,
+                i,
+                quant_inps,
+                fp_outs,
+                attention_mask,
+                attention_mask_batch,
+                position_embeddings,
+                traincast,
+                dtype,
+                dev,
+                logger,
+            )
 
 
         torch.cuda.empty_cache()
@@ -497,95 +406,21 @@ def liftq(
         ###############################################################                  
         # Stage2: finetuning all weights
         if args.finetuning_weights and i>=args.quant_start:
-            layerlist = [   ['q_proj',  'k_proj', 'v_proj'],
-                            ['o_proj'],
-                            ['in_proj_qkv', 'in_proj_z', 'out_proj'],
-                            ['gate_proj', 'up_proj'],
-                            ['down_proj'], ['ALL'],
-                            ]
-            for layer_group in layerlist:
-                print("start finetuning all weights")
-                if args.auto_mix_precision:
-                    replace_TmpLinaer_with_FWTLinear_mix(qlayer, args, layer_group, expc_list)
-                else:
-                    replace_TmpLinaer_with_FWTLinear(qlayer, args, layer_group)
-
-                qlayer = qlayer.to('cuda')
-                for name, param in model.named_parameters():
-                    param.requires_grad = False
-                for n,m in qlayer.named_modules():
-                    if isinstance(m, TmpLinear):
-                        m.weight = m.weight.detach()
-                if 'moe' in args.net.lower():
-                    weight_params = [{"params":get_n_set_parameters_byname_FWT(qlayer, ["weight", ]),"lr": args.lw_lr}]
-                else:
-                    if any(name.endswith('q_proj') for name, _ in qlayer.named_modules()):
-                        weight_params = [{"params":get_n_set_parameters_byname_FWT(l, ["weight", ]),"lr": min(args.lw_lr, l.weight.std().item()/50)} for l in [qlayer.self_attn.k_proj, qlayer.self_attn.v_proj, qlayer.self_attn.q_proj, qlayer.self_attn.o_proj, qlayer.mlp.up_proj, qlayer.mlp.gate_proj, qlayer.mlp.down_proj]]
-                    else:
-                        weight_params = [{"params":get_n_set_parameters_byname_FWT(l, ["weight", ]),"lr": min(args.lw_lr, l.weight.std().item()/50)} for l in [qlayer.linear_attn.in_proj_qkv, qlayer.linear_attn.in_proj_z, qlayer.linear_attn.out_proj, qlayer.mlp.up_proj, qlayer.mlp.gate_proj, qlayer.mlp.down_proj]]
-                
-                optimizer = torch.optim.AdamW(
-                        weight_params + [ {"params":get_n_set_parameters_byname_FWT(qlayer, ["scale" ]),"lr": args.lw_lr/5}, {"params":get_n_set_parameters_byname_FWT(qlayer, ["linear_" ]),"lr": args.lt_lr}, {"params":get_n_set_parameters_byname_FWT(qlayer, ["a1","a2" ]),"lr": args.la_lr}] ,weight_decay=args.wd)
-
-                #print_trainable_parameters(qlayer)
-                if layer_group == ['ALL']:
-                    epochs = args.epochs2
-                    if args.nsamples2 == args.nsamples:
-                        args.nsamples2 = args.nsamples2 - args.nsamples2//32
-                    samplenums= args.nsamples2
-                else:
-                    epochs = 0
-                    samplenums= 256
-
-                T = epochs * ( samplenums // args.batch_size)
-                #scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max = epochs * ( samplenums // args.batch_size), eta_min= 5e-7)
-                
-                empty_optimizer_list = [torch.optim.AdamW([torch.tensor(0)], lr=optimizer.param_groups[k]['lr']) for k in range(len(optimizer.param_groups))]
-                scheduler_list = [torch.optim.lr_scheduler.CosineAnnealingLR(empty_optimizer_list[k], T_max=T, eta_min = optimizer.param_groups[k]['lr']/20) for k in range(len(optimizer.param_groups))]
-
-                loss_scaler = utils.NativeScalerWithGradNormCount() 
-
-                for epoch in range(epochs):
-                    loss_list = []
-                    norm_list = []
-                    for j in range(samplenums //args.batch_size): 
-                        index = j * args.batch_size 
-                        with traincast(device_type='cuda',dtype=args.dtype):
-                            
-                            quant_out = qlayer(quant_inps[index:index+args.batch_size,].to(dev), attention_mask=attention_mask_batch,position_embeddings=position_embeddings)
-                            loss = loss_func(fp_outs[index:index+args.batch_size,].to(dev), quant_out)
-                        if not math.isfinite(loss.item()):
-                            logger.info("Loss is NAN, stopping training")
-                            
-                        else:  
-                            optimizer.zero_grad()  
-                            loss_list.append(loss.detach().cpu())
-                            norm = loss_scaler(loss, optimizer,parameters= get_parameters(qlayer)).cpu()
-                            #scheduler.step()
-                            # adjust lr
-                            
-                            for k in range(len(optimizer.param_groups)):
-                                scheduler_list[k].step()
-                                optimizer.param_groups[k]['lr'] = scheduler_list[k].get_lr()[0]
-                                if args.pvtuning:
-                                    if (epoch+j//8)%2 == 0:
-                                        if k>0:
-                                            optimizer.param_groups[k]['lr'] = 0.
-                                        else:
-                                            optimizer.param_groups[k]['lr'] =  scheduler_list[k].get_lr()[0]*10
-                                    else:
-                                        if k==0:
-                                            optimizer.param_groups[k]['lr'] = 0.
-                                
-                                    
-                
-                            norm_list.append(norm.data)
-                        loss_mean = torch.stack(loss_list).mean()
-                        norm_mean = torch.stack(norm_list).mean()
-                        if j%128 == 127:
-                            logger.info(f"layer {i} batchs {j} loss:{loss_mean} lr:{optimizer.param_groups[0]['lr'], optimizer.param_groups[1]['lr']} max memory_allocated {torch.cuda.max_memory_allocated(lm._device) / 1024**2} ")
-                            loss_list = []
-                            norm_list = []
+            qlayer = run_stage2_training(
+                qlayer,
+                args,
+                i,
+                expc_list if args.auto_mix_precision else None,
+                quant_inps,
+                fp_outs,
+                attention_mask,
+                attention_mask_batch,
+                position_embeddings,
+                traincast,
+                dtype,
+                dev,
+                logger,
+            )
 
         qlayer.to(dtype)
         with torch.no_grad():
