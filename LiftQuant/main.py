@@ -1,5 +1,6 @@
 import os
 import sys
+import argparse
 import random
 import numpy as np
 from models.LMClass import LMClass
@@ -165,8 +166,21 @@ def evaluate(lm, args, logger):
     return results
 
 
+def parse_quant_layers(value):
+    try:
+        indices = [int(item.strip()) for item in value.split(",") if item.strip()]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("quant layer indices must be integers") from exc
+    if not indices:
+        raise argparse.ArgumentTypeError("at least one quant layer index is required")
+    if any(index < 0 for index in indices):
+        raise argparse.ArgumentTypeError("quant layer indices must be non-negative")
+    if len(indices) != len(set(indices)):
+        raise argparse.ArgumentTypeError("quant layer indices must not contain duplicates")
+    return tuple(sorted(indices))
+
+
 def main():
-    import argparse
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, help="model name of model path")
@@ -200,6 +214,12 @@ def main():
     parser.add_argument("--align", type=int, default=-1)
     parser.add_argument("--quant_start", type=int, default=0)
     parser.add_argument("--quant_end", type=int, default=999)
+    parser.add_argument(
+        "--quant_layers",
+        type=parse_quant_layers,
+        default=None,
+        help="Comma-separated, zero-based decoder layer indices to quantize (for example: 2 or 2,5,9).",
+    )
     parser.add_argument("--fast_nearest", default=False, action="store_true")
     parser.add_argument("--pvtuning", default=False, action="store_true")
     parser.add_argument("--save_per_layer", default=False, action="store_true")
@@ -350,6 +370,16 @@ def main():
 
     lm.seqlen = args.seqlen#这里又会改变seqlen,这是为什么
     lm.model.eval()
+
+    if args.quant_layers is not None:
+        num_layers = len(lm.model.model.layers)
+        invalid_layers = [index for index in args.quant_layers if index >= num_layers]
+        if invalid_layers:
+            raise ValueError(
+                f"--quant_layers contains out-of-range indices {invalid_layers}; "
+                f"model has {num_layers} layers with valid indices 0-{num_layers - 1}"
+            )
+        logger.info(f"Explicit quantization layers: {list(args.quant_layers)}")
 
     args.hidden_dim = lm.model.config.hidden_size
     args.kv_group = lm.model.config.num_attention_heads // lm.model.config.num_key_value_heads
@@ -514,7 +544,10 @@ def main():
         if args.save_dir and args.save_per_layer == False:
       
             os.makedirs(args.save_dir, exist_ok=True)
-            save_path = os.path.join(args.save_dir,args.net, args.net+'+'+args.expc+'.pth')
+            layer_suffix = ""
+            if args.quant_layers is not None:
+                layer_suffix = "-layers" + "-".join(str(index) for index in args.quant_layers)
+            save_path = os.path.join(args.save_dir,args.net, args.net+'+'+args.expc+layer_suffix+'.pth')
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
             torch.save(lm.model.state_dict(), save_path)
             print(f"Quantized model has been saved to：{save_path}")

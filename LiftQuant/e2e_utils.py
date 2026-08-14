@@ -2,7 +2,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 from accelerate import init_empty_weights, dispatch_model, infer_auto_device_map
 import torch
 from tqdm import tqdm
-import gc  
+import gc
+import re
 from quantize.tmplinear import TmpLinear, FWTLinear
 
 
@@ -36,6 +37,17 @@ def set_op_by_name(layer, name, new_module):
         setattr(mod_, levels[-1], new_module)
     else:
         setattr(layer, name, new_module)
+
+
+def get_packed_quantized_layer_indices(state_dict):
+    pattern = re.compile(r"^model\.layers\.(\d+)\..*\.packed_weight$")
+    return sorted(
+        {
+            int(match.group(1))
+            for key in state_dict
+            if (match := pattern.match(key)) is not None
+        }
+    )
 
 def check_meta_tensors(model, context: str = "当前状态"):
     """
@@ -77,6 +89,20 @@ def check_meta_tensors(model, context: str = "当前状态"):
 def load_quantized_model(fp_model_path, quant_model_path, wbits, expc, w_ternary, load_per_layer, auto_mix_precision = False, eval_dtype = "float32"):
     print(f"Loading quantized model from {fp_model_path}")
 
+    state_dict = None
+    if not load_per_layer:
+        state_dict = torch.load(quant_model_path, map_location='cpu')
+        quantized_layer_indices = get_packed_quantized_layer_indices(state_dict)
+        if not quantized_layer_indices:
+            raise ValueError(
+                "LiftQuant checkpoint contains no packed quantized layers. "
+                "Run Stage2 with --finetuning_weights or convert the checkpoint to packed FWTLinear format."
+            )
+        for key in list(state_dict.keys()):
+            if key.endswith('.packed_weight'):
+                state_dict[key] = state_dict[key].flatten()
+        print(f"Detected packed quantized layers: {quantized_layer_indices}")
+
     # import pdb;pdb.set_trace()
     tokenizer = AutoTokenizer.from_pretrained(fp_model_path, use_fast=False)
     config = AutoConfig.from_pretrained(fp_model_path)
@@ -107,7 +133,13 @@ def load_quantized_model(fp_model_path, quant_model_path, wbits, expc, w_ternary
        0, 2, 0, 2, 0, 2, 0, 2, 1, 2, 0, 2, 1, 2, 0, 2, 1, 2, 0, 1, 1, 2,
        0, 2, 1, 2, 0, 2, 1, 2, 0, 2, 1, 2, 0, 2, 1, 2, 0, 2, 1, 2, 0, 1,
        1, 2, 1, 2, 2, 2, 0, 2, 2, 2, 0, 1, 2, 2, 1, 1, 2, 2]
-    for i in tqdm(range(len(layers))):
+    layers_to_replace = range(len(layers)) if load_per_layer else quantized_layer_indices
+    invalid_layers = [i for i in layers_to_replace if i >= len(layers)]
+    if invalid_layers:
+        raise ValueError(
+            f"Quantized layer indices {invalid_layers} exceed model layer count {len(layers)}"
+        )
+    for i in tqdm(layers_to_replace):
         layer = layers[i]
         named_linears = get_named_linears(layer, torch.nn.Linear)
         for name, module in named_linears.items():
@@ -181,16 +213,12 @@ def load_quantized_model(fp_model_path, quant_model_path, wbits, expc, w_ternary
 
             model.model.layers[i].load_state_dict(state_dict, assign=True, strict=False)
     else: #分支2
-        state_dict = torch.load(quant_model_path, map_location='cpu')
         '''for param_name, tensor in state_dict.items():
             print(f"参数名称 (Key): {param_name}")
             print(f"  - 形状 (Shape): {tensor.shape}")
             print(f"  - 数据类型 (Dtype): {tensor.dtype}")
             print(f"  - 所在设备 (Device): {tensor.device}")
             print("-" * 30)'''
-        for key in list(state_dict.keys()):
-            if key.endswith('.packed_weight'):
-                state_dict[key] = state_dict[key].flatten()
         model.load_state_dict(state_dict, assign=True, strict=False)
 
     #check_meta_tensors(model)

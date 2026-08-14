@@ -14,6 +14,7 @@ export HF_DATASETS_OFFLINE=1
 export EVAL_GSM8K=${EVAL_GSM8K:-0}
 export FULL_FINTUNE=${FULL_FINTUNE:-1}
 export GSM8K_REASONING_CAPABILITY=${GSM8K_REASONING_CAPABILITY:-no}
+export QUANT_LAYERS=${QUANT_LAYERS:-2}
 
 ARGS=(
     --model "$MODEL_PATH"
@@ -38,6 +39,7 @@ ARGS=(
     --usefullfp
     --training_trans
     --align 1
+    --quant_layers "$QUANT_LAYERS"
     --lscale_lr 5e-3
     --lexw_lr 2e-2
     --lw_lr 2e-5
@@ -64,5 +66,5 @@ fi
 # Demo 1: single GPU. Do not pass --quant_training_ddp so Stage1/Stage2 use the single-process path.
 CUDA_VISIBLE_DEVICES=0 torchrun --standalone --nproc_per_node=1 main.py "${ARGS[@]}" "$@"
 
-# Demo 2: multi GPU. Uncomment this line and comment out Demo 1 to enable Stage1/Stage2 DDP.
-# CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node=4 main.py "${ARGS[@]}" --quant_training_ddp "$@"
+# # Demo 2: multi GPU. Uncomment this line and comment out Demo 1 to enable Stage1/Stage2 DDP.
+# CUDA_VISIBLE_DEVICES=2,3 torchrun --standalone --nproc_per_node=2 main.py "${ARGS[@]}" --quant_training_ddp "$@"

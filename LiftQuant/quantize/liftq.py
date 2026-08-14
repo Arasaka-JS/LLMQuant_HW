@@ -126,11 +126,19 @@ def liftq(
         print('save non-layer-statedict')
         #把模型名字中没有layer的部分都摘出来单独保存为一个pth
     
+    explicit_quant_layers = args.quant_layers is not None
     args.quant_end = min(args.quant_end, len(layers))
-    for i in range(len(layers)):
-        if i >= args.quant_end:
-            layers[i] = None 
-        gc.collect()
+    if explicit_quant_layers:
+        quant_layer_indices = set(args.quant_layers)
+        processing_end = max(quant_layer_indices) + 1
+    else:
+        quant_layer_indices = set(range(args.quant_start, args.quant_end))
+        processing_end = args.quant_end
+        for i in range(len(layers)):
+            if i >= args.quant_end:
+                layers[i] = None
+            gc.collect()
+    logger.info(f"Layers selected for quantization: {sorted(quant_layer_indices)}")
 
         
     layers[0] = layers[0].to(dev)
@@ -221,7 +229,8 @@ def liftq(
     #### Fuse parameters of RMSNorm and Rotation, abtain new model arch 
     if 'qwen3.' not in args.net.lower():
         logger.info(f"=== Start fuse nrom layers ===")
-        for i in tqdm(range(args.quant_end)):
+        fuse_indices = sorted(quant_layer_indices) if explicit_quant_layers else range(args.quant_end)
+        for i in tqdm(fuse_indices):
             layer = layers[i].to(dev)
             
             for n,m in layer.named_modules():
@@ -254,37 +263,47 @@ def liftq(
 
     ########### 
    
-    for i in range(args.quant_end):
+    for i in range(processing_end):
         #i=4
-        logger.info(f"=== Start quantize layer {i} ===")
+        should_quantize = i in quant_layer_indices
+        logger.info(
+            f"=== {'Start quantize' if should_quantize else 'Run FP prefix'} layer {i} ==="
+        )
         qlayer = layers[i].to(dev)
         #if i==27:
         #    qlayer.to(float)
-        if 'moe' in args.net.lower():
-            act_disturb = get_act_means(qlayer, fp_outs, 32, 4,['q_proj', 'o_proj', 'experts.0.up_proj', 'experts.1.up_proj'],attention_mask=attention_mask,position_embeddings=position_embeddings)
-        else:
-            if any(name.endswith('q_proj') for name, _ in qlayer.named_modules()):
-                act_disturb = get_act_means(qlayer, fp_outs, 8, 4,['q_proj', 'o_proj', 'up_proj', 'down_proj'],attention_mask=attention_mask,position_embeddings=position_embeddings)
+        if should_quantize:
+            if 'moe' in args.net.lower():
+                act_disturb = get_act_means(qlayer, fp_outs, 32, 4,['q_proj', 'o_proj', 'experts.0.up_proj', 'experts.1.up_proj'],attention_mask=attention_mask,position_embeddings=position_embeddings)
             else:
-                act_disturb = get_act_means(qlayer, fp_outs, 8, 4,['in_proj_qkv', 'out_proj', 'up_proj', 'down_proj'],attention_mask=attention_mask,position_embeddings=position_embeddings)
-            
-        if args.auto_mix_precision:
+                if any(name.endswith('q_proj') for name, _ in qlayer.named_modules()):
+                    act_disturb = get_act_means(qlayer, fp_outs, 8, 4,['q_proj', 'o_proj', 'up_proj', 'down_proj'],attention_mask=attention_mask,position_embeddings=position_embeddings)
+                else:
+                    act_disturb = get_act_means(qlayer, fp_outs, 8, 4,['in_proj_qkv', 'out_proj', 'up_proj', 'down_proj'],attention_mask=attention_mask,position_embeddings=position_embeddings)
+
+        if should_quantize and args.auto_mix_precision:
             fp_inps = fp_outs.to('cpu')[:256].clone()
-        if args.epochs1 > 0:
-            with torch.no_grad():
-                with torch.amp.autocast(device_type='cuda', dtype=args.dtype):
-                    batch_size = args.batch_size * 2
-                    #args.batch_size = 2
-                    for j in tqdm(range(args.nsamples//batch_size)):
-                        index = j * batch_size
-                        fp_outs[index:index+batch_size,] = qlayer(fp_outs[index:index+batch_size,].to(dev), attention_mask=attention_mask,position_embeddings=position_embeddings).to('cpu').to(dtype)
-                        
+        with torch.no_grad():
+            with torch.amp.autocast(device_type='cuda', dtype=args.dtype):
+                batch_size = args.batch_size * 2
+                #args.batch_size = 2
+                for j in tqdm(range(args.nsamples//batch_size)):
+                    index = j * batch_size
+                    fp_outs[index:index+batch_size,] = qlayer(fp_outs[index:index+batch_size,].to(dev), attention_mask=attention_mask,position_embeddings=position_embeddings).to('cpu').to(dtype)
+
+        if not should_quantize:
+            quant_inps.copy_(fp_outs)
+            layers[i] = qlayer.to("cpu")
+            del qlayer
+            torch.cuda.empty_cache()
+            continue
+
         logger.info(f"=== Prepared quantize layer {i} ===")
         for m in qlayer.modules():
             if type(m) == nn.Linear:
                 m.weight.requires_grad_(False)
        
-        if i >= args.quant_start:
+        if should_quantize:
             ################################
             #Stage0: prepare scale
             print("Doing scale Init...")
@@ -405,7 +424,7 @@ def liftq(
         ####
         ###############################################################                  
         # Stage2: finetuning all weights
-        if args.finetuning_weights and i>=args.quant_start:
+        if args.finetuning_weights and should_quantize:
             qlayer = run_stage2_training(
                 qlayer,
                 args,
@@ -436,7 +455,7 @@ def liftq(
                     batch_size = args.batch_size * 2
                     for j in tqdm(range(args.nsamples//batch_size)): 
                         index = j*batch_size
-                        if i < args.quant_start or args.align <= 1:
+                        if explicit_quant_layers or i < args.quant_start or args.align <= 1:
                             quant_inps[index:index+batch_size,] = fp_outs[index:index+batch_size,]*1.
                         else:
                             quant_inps[index:index+batch_size,] = qlayer(quant_inps[index:index+batch_size,].to(dtype).to(dev), attention_mask=attention_mask,position_embeddings=position_embeddings).to('cpu')
@@ -458,8 +477,10 @@ def liftq(
             del qlayer
         else:
             layers[i] = qlayer.to("cpu")
+            if explicit_quant_layers:
+                quant_inps.copy_(fp_outs)
         torch.cuda.empty_cache()
-        if args.save_dir and args.save_per_layer and i>=args.quant_start:
+        if args.save_dir and args.save_per_layer and should_quantize:
             
             os.makedirs(args.save_dir, exist_ok=True)
             save_path = os.path.join(args.save_dir,args.net, args.net+'+'+args.expc+'-layer'+str(i)+'.pth')
