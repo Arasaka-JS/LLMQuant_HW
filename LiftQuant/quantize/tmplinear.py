@@ -71,6 +71,41 @@ def plot_box_plot(datalist, figname, titlelist, limit=0.5):
 
     return 0 
 
+class MoeSharedRotScale(nn.Module):
+    """Group-level shared rotation + scaling for MoE experts.
+
+    One instance is created per ``(group, projection_type)`` and owns the
+    shared ``Trans`` / ``a1`` / ``a2``.  Expert ``TmpLinear`` / ``FWTLinear``
+    modules only *reference* these objects (via ``object.__setattr__``) so they
+    are registered exactly once in ``state_dict()``.
+    """
+
+    def __init__(self, ic, expc, training_trans, groupsize):
+        super(MoeSharedRotScale, self).__init__()
+        self.ic = ic
+        self.training_trans = training_trans
+        self.groupsize = groupsize
+
+        parts = expc.split('to')
+        self.root = int(parts[1])
+        self.root2 = int(parts[0])
+        if self.root == 8:
+            self.transdim2 = 128 if ic > 10000 else 64
+        else:
+            self.transdim2 = 64
+        self.transdim1 = math.ceil(ic / self.transdim2)
+        self.expic = self.transdim1 * self.transdim2
+
+        # Keep the 2-D layout used by TmpLinear.find_params/quant_tmpweight.
+        self.a1 = nn.Parameter(torch.ones(self.transdim1, self.transdim2))
+        self.a2 = nn.Parameter(torch.ones(self.transdim1, self.transdim2 // self.root))
+
+        if training_trans:
+            self.Trans = HalfSVDDecomposeTransMatrix(self.transdim1, self.transdim2)
+        else:
+            self.Trans = None
+
+
 class FWTLinear(nn.Module):
     def __init__(
         self,
@@ -84,7 +119,9 @@ class FWTLinear(nn.Module):
         training_trans = False,
         bits = 2,
         groupsize = -1,
-        fast_nearest = True
+        fast_nearest = True,
+        shared = None,
+        to_buffer = True,
     ):
         self.maxq = 2**bits-1
         #print(self.maxq)
@@ -110,25 +147,48 @@ class FWTLinear(nn.Module):
 
         self.bias = tmp_module.bias
         with torch.no_grad():
-            self.register_parameter('scale', nn.Parameter(tmp_module.quantizer.scale.data*2*F.sigmoid(tmp_module.quantizer.alpha.data)))
-            self.register_parameter('a1', nn.Parameter(self.clamp_ste(tmp_module.a1.data, 0.02, 50)) )
-            #self.register_parameter('a2', nn.Parameter( (tmp_module.a3.data.reshape(-1)/tmp_module.a2.data.reshape(-1))))
-            self.register_parameter('a2', nn.Parameter( 1./tmp_module.a2.data.reshape(-1)))
+            if shared is not None:
+                # Group-shared rotation/scaling: reference the holder-owned objects
+                # instead of registering per-expert copies.
+                self.register_parameter('scale', nn.Parameter(tmp_module.quantizer.scale.data*2*F.sigmoid(tmp_module.quantizer.alpha.data)))
+                object.__setattr__(self, 'a1', shared.a1)
+                object.__setattr__(self, 'a2', shared.a2)
+                object.__setattr__(self, 'Trans', shared.Trans)
+                object.__setattr__(self, 'shared', shared)
 
-            self.weight = tmp_module.orilinear.weight.reshape(self.oc, self.transdim1, -1)  * self.a1.data
-
-            if self.training_trans:
-                self.Trans = tmp_module.Trans
-                self.weight = self.Trans(self.weight)
-                self.Trans.to_buffer()
+                self.weight = tmp_module.orilinear.weight.reshape(self.oc, self.transdim1, -1) * shared.a1.data
+                if self.training_trans:
+                    # Trans is still in training mode here; the caller converts it to
+                    # buffer (to_buffer) exactly once per group afterwards.
+                    self.weight = self.Trans(self.weight)
+                else:
+                    self.weight = Hadamard_trans(self.weight, self.transdim1, self.transdim2)
+                self.weight = self.weight * shared.a2.data.repeat_interleave(self.root, dim=-1)
+                self.weight = self.weight.reshape(self.oc, -1)
+                weight = self.weight
+                del self.weight
+                self.register_parameter('weight', nn.Parameter(weight))
             else:
-                self.weight = Hadamard_trans(self.weight, self.transdim1, self.transdim2)
-            self.weight = self.weight * tmp_module.a2.data.repeat_interleave(self.root, dim=-1)
-            self.weight = self.weight.reshape(self.oc, -1)
-            weight = self.weight
-            del self.weight
-            self.register_parameter('weight', nn.Parameter(weight))
-            self.a1.data = self.a1.data.reshape(-1)
+                self.register_parameter('scale', nn.Parameter(tmp_module.quantizer.scale.data*2*F.sigmoid(tmp_module.quantizer.alpha.data)))
+                self.register_parameter('a1', nn.Parameter(self.clamp_ste(tmp_module.a1.data, 0.02, 50)) )
+                #self.register_parameter('a2', nn.Parameter( (tmp_module.a3.data.reshape(-1)/tmp_module.a2.data.reshape(-1))))
+                self.register_parameter('a2', nn.Parameter( 1./tmp_module.a2.data.reshape(-1)))
+
+                self.weight = tmp_module.orilinear.weight.reshape(self.oc, self.transdim1, -1)  * self.a1.data
+
+                if self.training_trans:
+                    self.Trans = tmp_module.Trans
+                    self.weight = self.Trans(self.weight)
+                    if to_buffer:
+                        self.Trans.to_buffer()
+                else:
+                    self.weight = Hadamard_trans(self.weight, self.transdim1, self.transdim2)
+                self.weight = self.weight * tmp_module.a2.data.repeat_interleave(self.root, dim=-1)
+                self.weight = self.weight.reshape(self.oc, -1)
+                weight = self.weight
+                del self.weight
+                self.register_parameter('weight', nn.Parameter(weight))
+                self.a1.data = self.a1.data.reshape(-1)
         self.packed_flag = False
 
     def bit_channel_convert(self, fast=False):
@@ -195,6 +255,66 @@ class FWTLinear(nn.Module):
             print('related std error in ori domain', (self.get_weight()-ow).std()/ow.std())
             print('related std error in ori domain, Uniform Quantizater', (oqw-ow).std()/ow.std())
 
+    def prepare_shared_search(self):
+        # Per-expert part of the vector-quantization conversion for grouped MoE.
+        # Computes the per-row L2 norm and normalized weight used by the lattice
+        # nearest-neighbour search. Bit-identical to the inline logic formerly
+        # inside bit_channel_convert_shared().
+        if self.weight.dtype == torch.float16:
+            minmin = 1e-4
+            maxmax = 1e4
+        else:
+            minmin = 1e-7
+            maxmax = 1e7
+        l2 = torch.clamp(self.weight.pow(2).mean(dim=-1,keepdim=True).pow(0.5), minmin, maxmax)
+        norm_weight = self.weight/l2
+        norm_weight = norm_weight.reshape(-1,self.root)
+        return l2, norm_weight
+
+    def finalize_shared_search(self, qnorm_weight, l2):
+        qnorm_weight = qnorm_weight.reshape(l2.shape[0],-1)
+
+        del self.weight
+        self.register_parameter('weight', nn.Parameter(qnorm_weight * l2 ))
+
+        self.maxq = 1
+        self.scale.data = l2*2.
+        self.root = 1
+
+    def bit_channel_convert_shared(self, fast=False, cache=None):
+        # Per-expert part of the vector-quantization conversion for grouped MoE.
+        # Group-shared mutations (a2 root2-expansion and Trans.linear_right
+        # composition) are performed once per group by
+        # prepare_moe_shared_for_export().
+        l2, norm_weight = self.prepare_shared_search()
+        device = self.weight.device
+
+        if cache is not None:
+            T = cache['T']
+        else:
+            M_path = './lattice/' + self.expc +'.pt'
+            T = torch.load(M_path).to(device)
+
+        if fast:   # use to generate null weight in e2e finetune
+            alpha = self.root2/self.root
+            qnorm_weight = torch.randn(self.weight.shape[0], int(self.weight.shape[1]*alpha)).to(device)
+        else:
+            if self.fast_nearest:
+                qnorm_weight = self.find_nearest_fast(norm_weight, T, self.root2-self.root, batch_size=128, device=device, cache=cache)
+            else:
+                codes = torch.empty((2**self.root2, self.root2), dtype=torch.float32, device=device)
+                for i in range(self.root2):
+                    # 周期长度：2^(i+1)
+                    repeat_len = 2 ** (i + 1)
+                    block = torch.cat([torch.full((2**i,), -1.), torch.full((2**i,), 1.)]).to(self.weight)
+                    reps = 2**self.root2 // repeat_len
+                    codes[:, i] = block.repeat(reps)
+                points = codes@T.t()
+                indices = self.find_nearest_in_batches(norm_weight, points, batch_size=1024)    # (N,)
+                qnorm_weight = codes[indices]
+            print('related std error in trans domain',(qnorm_weight@T.t() - norm_weight).std()/ norm_weight.std())
+        self.finalize_shared_search(qnorm_weight, l2)
+
     def find_nearest_in_batches(self, A, points, batch_size=128):
         N = A.shape[0]
         M = points.shape[0]
@@ -214,27 +334,32 @@ class FWTLinear(nn.Module):
                 indices_list.append(idx)
         return torch.cat(indices_list, dim=0)
 
-    def find_nearest_fast(self, W, M, padding_length, batch_size=128, device='cuda'):
+    def find_nearest_fast(self, W, M, padding_length, batch_size=128, device='cuda', cache=None):
         M = M.to(W).to(torch.float32)
         # 预计算零空间基和逆矩阵（对于固定的M，这些是不变的）
         D_out, D_in = M.shape
         with torch.no_grad():
-            try:
-                _, _, Vh = torch.linalg.svd(M)
-                N = Vh[D_out:]
-                M_square = torch.cat([M, N], dim=0)
-                M_square_inv = torch.linalg.inv(M_square)
-            except torch.linalg.LinAlgError:
-                print("Benchmark SVD/inv failed. M might be singular.")
-                return float('inf')
-                
-            # 预计算 padding 向量
-            num_candidates_exp = padding_length
-            padding_vectors = torch.tensor(
-                list(product([-1, 1], repeat=num_candidates_exp)), 
-                dtype=torch.float32, device=device
-            )
-            num_candidates = padding_vectors.shape[0]
+            if cache is not None:
+                M_square_inv = cache['M_square_inv']
+                padding_vectors = cache['padding_vectors']
+                num_candidates = cache['num_candidates']
+            else:
+                try:
+                    _, _, Vh = torch.linalg.svd(M)
+                    N = Vh[D_out:]
+                    M_square = torch.cat([M, N], dim=0)
+                    M_square_inv = torch.linalg.inv(M_square)
+                except torch.linalg.LinAlgError:
+                    print("Benchmark SVD/inv failed. M might be singular.")
+                    return float('inf')
+                    
+                # 预计算 padding 向量
+                num_candidates_exp = padding_length
+                padding_vectors = torch.tensor(
+                    list(product([-1, 1], repeat=num_candidates_exp)), 
+                    dtype=torch.float32, device=device
+                )
+                num_candidates = padding_vectors.shape[0]
         encoded_vectors_list = []
         vectors_to_encode = W.view(-1, D_out)
         num_vectors = vectors_to_encode.shape[0]
@@ -291,6 +416,18 @@ class FWTLinear(nn.Module):
     def clamp_ste(self, x: torch.Tensor, min, max):
         return (x.clamp(min,max) - x).detach() + x
     
+    def _a1(self):
+        shared = getattr(self, 'shared', None)
+        return shared.a1 if shared is not None else self.a1
+
+    def _a2(self):
+        shared = getattr(self, 'shared', None)
+        return shared.a2 if shared is not None else self.a2
+
+    def _trans(self):
+        shared = getattr(self, 'shared', None)
+        return shared.Trans if shared is not None else self.Trans
+
     def get_oldqweight(self):
         if True:
             if self.groupsize == -1:
@@ -301,13 +438,13 @@ class FWTLinear(nn.Module):
                 weight = (torch.clamp(self.round_ste(self.weight.reshape([-1,160])/scale+self.maxq/2), 0, self.maxq) - self.maxq/2) * self.scale 
                 weight = weight.reshape(shape)
             
-            weight = weight * self.a2.repeat_interleave(self.root, dim=-1)  
+            weight = weight * self._a2().repeat_interleave(self.root, dim=-1)  
             if self.training_trans:
-                weight = self.Trans(weight, True)
+                weight = self._trans()(weight, True)
             else:
                 weight = Hadamard_trans(weight, dim1= self.transdim1, dim2=self.transdim2, inv = True)
             weight = weight.reshape(self.oc, self.transdim1, self.transdim2)[:,:,:self.expic//self.transdim1]
-            weight = weight.reshape(self.oc, self.expic)/self.a1
+            weight = weight.reshape(self.oc, self.expic)/self._a1().reshape(-1)
         return weight
 
     def miniFunction1(self,x, scale):
@@ -331,25 +468,25 @@ class FWTLinear(nn.Module):
                 weight = (torch.clamp(self.round_ste(self.weight.reshape([-1,160])/scale+self.maxq/2), 0, self.maxq) - self.maxq/2) * self.scale 
                 weight = weight.reshape(shape)
             
-            weight = weight * self.a2.repeat_interleave(self.root, dim=-1)   #checkpoint(self.miniFunction2, weight, self.a2)
+            weight = weight * self._a2().repeat_interleave(self.root, dim=-1)   #checkpoint(self.miniFunction2, weight, self.a2)
             if self.training_trans:
-                weight = self.Trans(weight, True) #checkpoint(self.Trans, weight, True) # 
+                weight = self._trans()(weight, True) #checkpoint(self.Trans, weight, True) # 
             else:
                 weight = Hadamard_trans(weight, dim1= self.transdim1, dim2=self.transdim2, inv = True)
             weight = weight.reshape(self.oc, self.transdim1, self.transdim2)[:,:,:self.expic//self.transdim1]
-            weight = weight.reshape(self.oc, self.expic)/self.a1#checkpoint(self.miniFunction3, weight, self.a1)
+            weight = weight.reshape(self.oc, self.expic)/self._a1().reshape(-1)#checkpoint(self.miniFunction3, weight, self.a1)
             
         return weight
     
     def get_oriweight(self):
         if True:
-            weight = self.weight * self.a2.repeat_interleave(self.root, dim=-1)  
+            weight = self.weight * self._a2().repeat_interleave(self.root, dim=-1)  
             if self.training_trans:
-                weight = self.Trans(weight, True)
+                weight = self._trans()(weight, True)
             else:
                 weight = Hadamard_trans(weight, dim1= self.transdim1, dim2=self.transdim2, inv = True)
             weight = weight.reshape(self.oc, self.transdim1, self.transdim2)[:,:,:self.expic//self.transdim1]
-            weight = weight.reshape(self.oc, self.expic)/self.a1
+            weight = weight.reshape(self.oc, self.expic)/self._a1().reshape(-1)
         return weight
 
     '''def unpack_bits_uint8(self, packed: torch.Tensor):
@@ -382,8 +519,33 @@ class FWTLinear(nn.Module):
         self.packed_flag = True
 
     def forward(self, x):
+        weight_fp = getattr(self, '_weight_fp', None)
+        if weight_fp is not None:
+            return F.linear(x, weight_fp.to(x), self.bias)
         weight = checkpoint(self.get_weight, use_reentrant=False)
-        return F.linear(x, weight[:, :self.ic].to(x), self.bias) 
+        return F.linear(x, weight[:, :self.ic].to(x), self.bias)
+
+    @torch.no_grad()
+    def materialize(self):
+        """Pre-dequantize the packed weight once and cache it as an FP buffer.
+
+        ``get_weight()`` is a pure function (packed bits -> scale -> rotation ->
+        reshape -> a1), so caching its output is bit-identical to recomputing it
+        on every forward.  This removes the per-token dequantization cost during
+        evaluation (especially for MoE, where top-k experts are re-dequantized
+        per token).  The quantization-only storage (``packed_weight``/``scale``)
+        is released to keep peak memory near the FP baseline.
+        """
+        if hasattr(self, '_weight_fp'):
+            return self
+        weight_fp = self.get_weight()[:, :self.ic].contiguous()
+        self.register_buffer('_weight_fp', weight_fp, persistent=False)
+        for name in ('packed_weight',):
+            if name in self._buffers:
+                del self._buffers[name]
+        if 'scale' in self._parameters:
+            del self._parameters['scale']
+        return self
 
 class TmpLinear(nn.Module):
     def __init__(
@@ -393,7 +555,8 @@ class TmpLinear(nn.Module):
         expc = '32to16',
         training_trans = False, 
         groupsize = -1, 
-        fast_nearest = True
+        fast_nearest = True,
+        shared = None
     ):
         super(TmpLinear, self).__init__()
         self.orilinear = org_module
@@ -412,8 +575,15 @@ class TmpLinear(nn.Module):
         self.expic = self.transdim1 * self.transdim2
         
         self.orilinear.weight.data = F.pad(self.orilinear.weight.data, (0, self.expic - self.ic), mode="constant", value=0)
-        self.a1 = nn.Parameter(torch.ones(self.expic).to(self.orilinear.weight))
-        self.a2 = nn.Parameter(torch.ones(self.transdim1, self.transdim2//self.root).to(self.orilinear.weight))
+        if shared is not None:
+            object.__setattr__(self, 'a1', shared.a1)
+            object.__setattr__(self, 'a2', shared.a2)
+            object.__setattr__(self, 'Trans', shared.Trans)
+            object.__setattr__(self, 'shared', shared)
+        else:
+            self.a1 = nn.Parameter(torch.ones(self.expic).to(self.orilinear.weight))
+            self.a2 = nn.Parameter(torch.ones(self.transdim1, self.transdim2//self.root).to(self.orilinear.weight))
+            self.Trans = None
         #self.a3 = nn.Parameter(torch.ones(self.transdim1, self.transdim2//self.root).to(self.orilinear.weight))
         self.fwd_func = F.linear
         self.quantizer = Quantizer()
@@ -434,7 +604,7 @@ class TmpLinear(nn.Module):
         self.norm = 2
         self.GPTQ = False
         self.training_trans = training_trans
-        if self.training_trans:
+        if shared is None and self.training_trans:
             if groupsize ==128 :
                 #self.Trans = GHalfSVDDecomposeTransMatrix(self.transdim1//2 ,8,20)
                 #self.Trans = HalfSVDDecomposeTransMatrix(self.transdim1, self.transdim2, diag_init = True)
@@ -470,17 +640,32 @@ class TmpLinear(nn.Module):
     
     def clamp_ste(self, x: torch.Tensor, min, max):
         return (x.clamp(min,max) - x).detach() + x
+
+    def _a1(self):
+        shared = getattr(self, 'shared', None)
+        return shared.a1 if shared is not None else self.a1
+
+    def _a2(self):
+        shared = getattr(self, 'shared', None)
+        return shared.a2 if shared is not None else self.a2
+
+    def _trans(self):
+        shared = getattr(self, 'shared', None)
+        return shared.Trans if shared is not None else self.Trans
+
     def find_params(self):
-        self.a1.data = self.a1.data.reshape(self.transdim1, self.expic//self.transdim1)
-        self.weight = self.orilinear.weight.reshape(self.oc, self.transdim1, -1) * self.clamp_ste(self.a1,0.02,50)
+        a1 = self._a1()
+        if a1.data.shape != (self.transdim1, self.expic//self.transdim1):
+            a1.data = a1.data.reshape(self.transdim1, self.expic//self.transdim1)
+        self.weight = self.orilinear.weight.reshape(self.oc, self.transdim1, -1) * self.clamp_ste(a1,0.02,50)
         self.weight = self.weight.detach()
         if self.input_trans:
             if self.training_trans:
-                self.weight = self.Trans(self.weight)
+                self.weight = self._trans()(self.weight)
             else:
                 self.weight = Hadamard_trans(self.weight, self.transdim1, self.transdim2)
         
-        self.weight = self.weight * self.a2.repeat_interleave(self.root, dim=-1)
+        self.weight = self.weight * self._a2().repeat_interleave(self.root, dim=-1)
         
         if self.groupsize == -1:
             self.quantizer.find_params(self.weight.reshape(self.oc, -1), weight=True)
@@ -490,15 +675,15 @@ class TmpLinear(nn.Module):
     def quant_tmpweight(self):
         #self.check_nan(self.orilinear.weight,'oriweight')
         #print(self.a1.max(),self.a1.min())
-        self.weight = self.orilinear.weight.reshape(self.oc, self.transdim1, -1)  * self.clamp_ste(self.a1,0.02,50)
+        self.weight = self.orilinear.weight.reshape(self.oc, self.transdim1, -1)  * self.clamp_ste(self._a1(),0.02,50)
         #self.check_nan(self.weight,'transweight1')
         if self.input_trans:
             if self.training_trans:
-                self.weight = self.Trans(self.weight)
+                self.weight = self._trans()(self.weight)
             else:
                 self.weight = Hadamard_trans(self.weight, self.transdim1, self.transdim2)
         #self.check_nan(self.weight,'transweight2')
-        self.weight = self.weight * self.a2.repeat_interleave(self.root, dim=-1)
+        self.weight = self.weight * self._a2().repeat_interleave(self.root, dim=-1)
         #self.check_nan(self.weight,'transweight3')
         if self.showflag:
             print('tmp')
@@ -514,17 +699,17 @@ class TmpLinear(nn.Module):
         self.weight = self.weight.reshape(self.oc, self.transdim1, -1)
         
         #self.weight = self.weight * (self.a3 / self.a2).repeat_interleave(self.root, dim=-1)
-        self.weight = self.weight / (self.a2).repeat_interleave(self.root, dim=-1)
+        self.weight = self.weight / (self._a2()).repeat_interleave(self.root, dim=-1)
         if self.showflag:
             print('scale, a2',self.weight.flatten()[:16])
         if self.input_trans:
             if self.training_trans:
-                self.weight = self.Trans(self.weight, inv_t=True)
+                self.weight = self._trans()(self.weight, inv_t=True)
             else:
                 self.weight = Hadamard_trans(self.weight, self.transdim1, self.transdim2, inv=True)
         if self.showflag:
             print('hadmard',self.weight.flatten()[:16])
-        self.weight = self.weight[:, :, :self.expic//self.transdim1] / self.clamp_ste(self.a1,0.02,50)
+        self.weight = self.weight[:, :, :self.expic//self.transdim1] / self.clamp_ste(self._a1(),0.02,50)
         self.weight = self.weight.reshape(self.oc, self.expic)
         if self.showflag:
             print('clip a1',self.weight.flatten()[:16])
@@ -630,6 +815,351 @@ def strtrans(inp):
         return 2.78
     if inp =='np':
         return 2.25
+
+_LATTICE_SEARCH_CACHE = {}
+
+# Chunk size used by find_nearest_fast when batching multiple MoE experts.
+# The nearest-neighbour search is per-row, so this only affects throughput and
+# memory (not numerical results). Bump to 512+ if the GPU has headroom.
+_NEAREST_BATCH_SIZE = 256
+
+
+def get_lattice_search_cache(expc, device):
+    """Build (once per expc/device) and cache the lattice search structure.
+
+    Precomputes the lattice tensor ``T``, its null-space completion/inverse and
+    the ``2**(root2-root)`` sign-candidate table that ``find_nearest_fast``
+    needs. These only depend on ``expc``, so sharing them across the 128*3
+    expert projections avoids recomputing them (and re-``torch.load``-ing the
+    lattice file) hundreds of times.
+    """
+    key = (expc, str(device))
+    cache = _LATTICE_SEARCH_CACHE.get(key)
+    if cache is not None:
+        return cache
+
+    T = torch.load(f'./lattice/{expc}.pt').to(device).to(torch.float32)
+    root = int(expc.split('to')[1])
+    root2 = int(expc.split('to')[0])
+    padding_length = root2 - root
+
+    _, _, Vh = torch.linalg.svd(T)
+    N = Vh[T.shape[0]:]
+    M_square = torch.cat([T, N], dim=0)
+    M_square_inv = torch.linalg.inv(M_square)
+    padding_vectors = torch.tensor(
+        list(product([-1, 1], repeat=padding_length)),
+        dtype=torch.float32, device=device,
+    )
+
+    cache = {
+        'T': T,
+        'M_square_inv': M_square_inv,
+        'padding_vectors': padding_vectors,
+        'num_candidates': padding_vectors.shape[0],
+    }
+    _LATTICE_SEARCH_CACHE[key] = cache
+    return cache
+
+
+def _is_moe_block(module):
+    return (
+        hasattr(module, "experts")
+        and isinstance(module.experts, nn.ModuleList)
+        and len(module.experts) > 0
+        and hasattr(module.experts[0], "gate_proj")
+    )
+
+
+def _replace_moe_block_grouped(moe_block, args, num_groups):
+    num_experts = len(moe_block.experts)
+    group_size = math.ceil(num_experts / num_groups)
+    proj_types = ["gate_proj", "up_proj", "down_proj"]
+
+    moe_block.moe_shared = nn.ModuleList()
+    moe_block.moe_num_groups = num_groups
+    moe_block.moe_group_size = group_size
+
+    for g in range(num_groups):
+        holders = nn.ModuleDict()
+        for p in proj_types:
+            ic = getattr(moe_block.experts[g * group_size], p).in_features
+            holders[p] = MoeSharedRotScale(ic, args.expc, args.training_trans, args.groupsize)
+        moe_block.moe_shared.append(holders)
+
+        for e in range(g * group_size, min((g + 1) * group_size, num_experts)):
+            expert = moe_block.experts[e]
+            for p in proj_types:
+                lin = getattr(expert, p)
+                setattr(
+                    expert,
+                    p,
+                    TmpLinear(
+                        lin,
+                        args.wbits,
+                        expc=args.expc,
+                        training_trans=args.training_trans,
+                        groupsize=args.groupsize,
+                        fast_nearest=args.fast_nearest,
+                        shared=holders[p],
+                    ),
+                )
+
+
+def replace_linear_with_TmpLinear_moe(model, args, num_groups=1):
+    for n, m in model.named_children():
+        if _is_moe_block(m):
+            _replace_moe_block_grouped(m, args, num_groups)
+        elif isinstance(m, nn.Linear):
+            if (
+                'q_proj' in n or 'k_proj' in n or 'v_proj' in n or 'o_proj' in n
+                or 'in_proj_qkv' in n or 'in_proj_z' in n or 'out_proj' in n
+            ):
+                if 'orilinear' not in n:
+                    print(n)
+                    setattr(
+                        model,
+                        n,
+                        TmpLinear(
+                            m,
+                            args.wbits,
+                            expc=args.expc,
+                            training_trans=args.training_trans,
+                            groupsize=args.groupsize,
+                            fast_nearest=args.fast_nearest,
+                        ),
+                    )
+        else:
+            replace_linear_with_TmpLinear_moe(m, args, num_groups)
+
+
+def prepare_moe_shared_for_export(holder, T, device):
+    root = holder.root
+    root2 = holder.root2
+    transdim2 = holder.transdim2
+
+    holder.a2.data = (1.0 / holder.a2.data).reshape(-1).repeat_interleave(root2)
+
+    if holder.Trans is not None:
+        M = torch.zeros(transdim2 // root * root2, transdim2, device=device).to(T)
+        for i in range(transdim2 // root):
+            M[i * root2:(i + 1) * root2, i * root:(i + 1) * root] = T.t()
+        mr = holder.Trans.linear_right.data.to(device)
+        holder.Trans.linear_right.data = (M @ mr).to(holder.Trans.linear_right)
+
+
+def _convert_moe_block_grouped(moe_block, args, layers, structure_only, search_rank=None, search_world_size=None):
+    proj_types = ["gate_proj", "up_proj", "down_proj"]
+    active = [p for p in proj_types if any(layer in p for layer in layers)]
+    if not active:
+        return
+
+    num_experts = len(moe_block.experts)
+    num_groups = len(moe_block.moe_shared)
+    group_size = getattr(moe_block, "moe_group_size", math.ceil(num_experts / num_groups))
+    sharded = (search_world_size is not None and search_world_size > 1)
+
+    for g in range(num_groups):
+        holders = moe_block.moe_shared[g]
+        start = g * group_size
+        end = min((g + 1) * group_size, num_experts)
+
+        for p in active:
+            holder = holders[p]
+            expc = args.expc
+
+            # Step 1: convert each expert TmpLinear -> FWTLinear (shared refs, no buffer yet)
+            for e in range(start, end):
+                tmp = getattr(moe_block.experts[e], p)
+                if not isinstance(tmp, TmpLinear):
+                    continue
+                fwt = FWTLinear()
+                fwt.convert_form_tmplinear(
+                    tmp,
+                    bits=args.wbits,
+                    expc=expc,
+                    training_trans=args.training_trans,
+                    groupsize=args.groupsize,
+                    fast_nearest=args.fast_nearest,
+                    shared=holder,
+                    to_buffer=False,
+                )
+                setattr(moe_block.experts[e], p, fwt)
+
+            # Step 2: group-shared materialization once per (group, projection)
+            if holder.Trans is not None:
+                holder.Trans.to_buffer()
+            fwt0 = getattr(moe_block.experts[start], p)
+            cache = get_lattice_search_cache(expc, fwt0.weight.device)
+            prepare_moe_shared_for_export(holder, cache['T'], fwt0.weight.device)
+
+            # Step 3: per-expert vector quantization. When sharding, each rank
+            # performs the real search only for the experts it owns
+            # (e % world_size == rank); the rest are left as placeholder null
+            # weights and later filled in via all_gather. The search is per-row,
+            # so sharding is bit-identical to a single-rank full search.
+            fwts = [getattr(moe_block.experts[e], p) for e in range(start, end)]
+            if structure_only:
+                for fwt in fwts:
+                    fwt.bit_channel_convert_shared(fast=True, cache=cache)
+                continue
+
+            if sharded:
+                owned = [e for e in range(start, end) if e % search_world_size == search_rank]
+                for e in range(start, end):
+                    if e in owned:
+                        continue
+                    fwt = getattr(moe_block.experts[e], p)
+                    fwt.bit_channel_convert_shared(fast=True, cache=cache)
+                if not owned:
+                    continue
+                owned_fwts = [getattr(moe_block.experts[e], p) for e in owned]
+            else:
+                owned_fwts = fwts
+
+            if all(getattr(fwt, 'fast_nearest', False) for fwt in owned_fwts):
+                # Prepare owned experts, run a single batched nearest-neighbour
+                # search, then finalize per expert. The search is per-row, so
+                # concatenating experts is bit-identical to per-expert calls.
+                l2s = []
+                norm_weights = []
+                for fwt in owned_fwts:
+                    l2, nw = fwt.prepare_shared_search()
+                    l2s.append(l2)
+                    norm_weights.append(nw)
+                nw_all = torch.cat(norm_weights, dim=0)
+                q_all = owned_fwts[0].find_nearest_fast(
+                    nw_all,
+                    cache['T'],
+                    owned_fwts[0].root2 - owned_fwts[0].root,
+                    batch_size=_NEAREST_BATCH_SIZE,
+                    device=owned_fwts[0].weight.device,
+                    cache=cache,
+                )
+                qs = q_all.split([nw.shape[0] for nw in norm_weights], dim=0)
+                for fwt, q, l2 in zip(owned_fwts, qs, l2s):
+                    fwt.finalize_shared_search(q, l2)
+            else:
+                # Exact (slow) search path — keep per-expert to preserve the
+                # original find_nearest_in_batches behaviour.
+                for fwt in owned_fwts:
+                    fwt.bit_channel_convert_shared(fast=False, cache=cache)
+
+
+def replace_TmpLinaer_with_FWTLinear_moe(model, args, layers, expc_list=None, structure_only=False, search_rank=None, search_world_size=None):
+    for n, m in model.named_children():
+        if _is_moe_block(m):
+            _convert_moe_block_grouped(m, args, layers, structure_only, search_rank, search_world_size)
+        elif isinstance(m, TmpLinear):
+            for layer in layers:
+                if layer in n:
+                    print(n)
+                    expc = args.expc
+                    if expc_list is not None:
+                        if 'q_proj' in n or 'k_proj' in n or 'v_proj' in n:
+                            expc = expc_list[0]
+                        elif 'o_proj' in n:
+                            expc = expc_list[1]
+                        elif 'up_proj' in n or 'gate_proj' in n:
+                            expc = expc_list[2]
+                        elif 'down_proj' in n:
+                            expc = expc_list[3]
+                    fwt = FWTLinear()
+                    fwt.convert_form_tmplinear(
+                        m,
+                        bits=args.wbits,
+                        expc=expc,
+                        training_trans=args.training_trans,
+                        groupsize=args.groupsize,
+                        fast_nearest=args.fast_nearest,
+                    )
+                    if structure_only:
+                        fwt.bit_channel_convert(fast=True)
+                    else:
+                        fwt.bit_channel_convert()
+                    setattr(model, n, fwt)
+        else:
+            replace_TmpLinaer_with_FWTLinear_moe(m, args, layers, expc_list, structure_only, search_rank, search_world_size)
+
+
+def make_fwtlinear_eval(lin, wbits, expc, device='cpu', dtype=torch.float16):
+    """Build a single dense FWTLinear eval structure with null weights.
+
+    Mirrors the structure-building in ``e2e_utils.load_quantized_model`` so the
+    resulting module has the same keys/shapes as a packed LiftQuant checkpoint.
+    """
+    fake = nn.Linear(lin.in_features, lin.out_features, lin.bias is not None, device=device, dtype=dtype)
+    tmp = TmpLinear(fake, wbits, expc=expc, training_trans=True, groupsize=-1)
+    tmp.find_params()
+    tmp.quantizer.alpha = nn.Parameter(torch.zeros(tmp.quantizer.scale.shape, device=device, dtype=dtype))
+    fwt = FWTLinear()
+    fwt.convert_form_tmplinear(tmp, bits=wbits, expc=expc, training_trans=True, groupsize=-1)
+    fwt.bit_channel_convert(True)
+    fwt.pack_to_int8()
+    return fwt
+
+
+def build_moe_grouped_fwt_eval(moe_block, wbits, expc, num_groups, device='cpu', dtype=torch.float16):
+    """Build the grouped FWTLinear eval structure for a MoE block.
+
+    Replaces each expert ``gate_proj/up_proj/down_proj`` ``nn.Linear`` with an
+    ``FWTLinear`` that references group-shared ``MoeSharedRotScale`` holders, so
+    the structure matches a grouped LiftQuant checkpoint
+    (``mlp.moe_shared.{g}.{proj}.*`` + per-expert ``scale/packed_weight``).
+    """
+    num_experts = len(moe_block.experts)
+    group_size = math.ceil(num_experts / num_groups)
+    proj_types = ['gate_proj', 'up_proj', 'down_proj']
+
+    moe_block.moe_shared = nn.ModuleList()
+    moe_block.moe_num_groups = num_groups
+    moe_block.moe_group_size = group_size
+
+    for g in range(num_groups):
+        holders = nn.ModuleDict()
+        for p in proj_types:
+            ic = getattr(moe_block.experts[g * group_size], p).in_features
+            holder = MoeSharedRotScale(ic, expc, training_trans=True, groupsize=-1).to(device=device)
+            # Keep the orthogonal rotation in float32 (the cayley parametrization
+            # needs LU solve), while scaling params match the checkpoint dtype.
+            holder.a1.data = holder.a1.data.to(dtype=dtype)
+            holder.a2.data = holder.a2.data.to(dtype=dtype)
+            holders[p] = holder
+        moe_block.moe_shared.append(holders)
+
+        start = g * group_size
+        end = min((g + 1) * group_size, num_experts)
+        for p in proj_types:
+            holder = holders[p]
+            # Step 1: convert each expert Linear -> FWTLinear (shared refs, no buffer yet)
+            for e in range(start, end):
+                lin = getattr(moe_block.experts[e], p)
+                fake = nn.Linear(lin.in_features, lin.out_features, lin.bias is not None, device=device, dtype=dtype)
+                tmp = TmpLinear(fake, wbits, expc=expc, training_trans=True, groupsize=-1, shared=holder)
+                tmp.find_params()
+                tmp.quantizer.alpha = nn.Parameter(torch.zeros(tmp.quantizer.scale.shape, device=device, dtype=dtype))
+                fwt = FWTLinear()
+                fwt.convert_form_tmplinear(
+                    tmp,
+                    bits=wbits,
+                    expc=expc,
+                    training_trans=True,
+                    groupsize=-1,
+                    shared=holder,
+                    to_buffer=False,
+                )
+                setattr(moe_block.experts[e], p, fwt)
+            # Step 2: group-shared materialization once per (group, projection)
+            if holder.Trans is not None:
+                holder.Trans.to_buffer()
+            T = torch.load('./lattice/' + expc + '.pt').to(device)
+            prepare_moe_shared_for_export(holder, T, device)
+            # Step 3: per-expert fast vector quantization + packing
+            for e in range(start, end):
+                fwt = getattr(moe_block.experts[e], p)
+                fwt.bit_channel_convert_shared(fast=True)
+                fwt.pack_to_int8()
+
 
 def get_layer_parameters(model, bitslist):
     pnums = 0

@@ -2,6 +2,7 @@
 """Evaluate AutoRound, LiftQuant, or floating-point models with lm-eval using local datasets only."""
 
 import argparse
+import glob
 import json
 import os
 import sys
@@ -160,9 +161,12 @@ def validate_hf_model_dir(model_dir: Path, label: str) -> None:
 
 def validate_liftquant_checkpoint(quant_model_path: Path, load_per_layer: bool) -> None:
     if load_per_layer:
-        non_layer_path = Path(f"{quant_model_path}-non_layer.pth")
-        if not non_layer_path.is_file():
-            raise FileNotFoundError(f"LiftQuant non-layer checkpoint not found: {non_layer_path}")
+        # 逐层/部分量化：只要存在至少一个 layer{i}.pth 即可；
+        # non_layer.pth 不再强制（embed/norm/lm_head 已由 FP 模型提供）。
+        if not glob.glob(f"{quant_model_path}-layer*.pth"):
+            raise FileNotFoundError(
+                f"No per-layer LiftQuant checkpoints found matching: {quant_model_path}-layer*.pth"
+            )
     elif not quant_model_path.is_file():
         raise FileNotFoundError(f"LiftQuant checkpoint not found: {quant_model_path}")
 

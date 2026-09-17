@@ -236,7 +236,8 @@ def main():
     parser.add_argument("--mpp", type=float, default=0.001)
 
     parser.add_argument("--training_trans", default=False, action="store_true", help="Use SVD training matrix")
-    parser.add_argument("--expc", type=str, default="n")
+    parser.add_argument("--expc", type=str, default="24to8")
+    parser.add_argument("--moe_num_groups", type=int, default=1, help="Number of shared rotation/scale groups for MoE experts (default 1)")
     parser.add_argument("--hex", default=False, action="store_true")
     parser.add_argument("--finetuning_weights", default=False, action="store_true")
     parser.add_argument("--usefullfp", default=False, action="store_true")
@@ -427,16 +428,20 @@ def main():
     }
 
     # quantization
+    model_type = getattr(lm.model.config, 'model_type', '') or ''
+    architectures = [a.lower() for a in (getattr(lm.model.config, 'architectures', None) or [])]
+    is_moe = model_type in ('qwen3_moe', 'qwen2_moe') or any('moe' in a for a in architectures)
+
     if 'llama-2' in args.net.lower():
         args.cache_name = 'llama-2'
     elif 'llama-3' in args.net.lower():
         args.cache_name = 'llama-3'
+    elif is_moe:
+        args.cache_name = 'qwen3-moe'
     elif 'qwen2.5' in args.net.lower():
         args.cache_name = 'qwen2.5'
     elif 'qwen2' in args.net.lower():
         args.cache_name = 'qwen2'
-    elif 'qwen3-moe' in args.net.lower():
-        args.cache_name = 'qwen3-moe'
     elif 'qwen3.5' in args.net.lower():
         args.cache_name = 'qwen3.5'
     elif 'qwen3.6' in args.net.lower():

@@ -1,6 +1,7 @@
 import transformers
 import torch
 from .models_utils import BaseLM, find_layers
+from .qwen3_moe_per_expert import patch_qwen3_moe_per_expert
 from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
 import torch.nn.functional as F
 from torch import nn
@@ -33,6 +34,7 @@ class LMClass(BaseLM):
         )
         self.tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False,legacy=False)
         #self.model = AutoModelForCausalLM.from_pretrained(args.model, config=config, device_map='cpu',torch_dtype=config.torch_dtype)
+        patch_qwen3_moe_per_expert()
         self.model = AutoModelForCausalLM.from_pretrained(args.model, config=config, device_map='cpu',torch_dtype=args.dtype)
         self.seqlen = self.model.config.max_position_embeddings
         self.model.eval()

@@ -11,10 +11,14 @@ from transformers import AutoConfig, AutoModelForCausalLM
 import utils
 from quantize.tmplinear import (
     FWTLinear,
+    MoeSharedRotScale,
     TmpLinear,
+    _is_moe_block,
     replace_TmpLinaer_with_FWTLinear,
     replace_TmpLinaer_with_FWTLinear_mix,
+    replace_TmpLinaer_with_FWTLinear_moe,
     replace_linear_with_TmpLinear,
+    replace_linear_with_TmpLinear_moe,
 )
 from quantize.utils import get_parameters
 
@@ -95,6 +99,8 @@ def _prepare_stage1(qlayer, args):
     scale_list1 = []
     scale_list2 = []
     w_list = []
+    seen_a1 = set()
+    seen_a2 = set()
 
     for _, module in qlayer.named_modules():
         if isinstance(module, TmpLinear):
@@ -111,10 +117,16 @@ def _prepare_stage1(qlayer, args):
                 module.quantizer.register_parameter("alpha", nn.Parameter(alpha))
             wq_alpha.append(module.quantizer.alpha)
             module.quantizer.alpha.requires_grad = True
-            module.a2.requires_grad = True
-            module.a1.requires_grad = True
-            scale_list1.append(module.a2)
-            scale_list2.append(module.a1)
+            a1 = module._a1()
+            a2 = module._a2()
+            a2.requires_grad = True
+            a1.requires_grad = True
+            if id(a2) not in seen_a2:
+                seen_a2.add(id(a2))
+                scale_list1.append(a2)
+            if id(a1) not in seen_a1:
+                seen_a1.add(id(a1))
+                scale_list2.append(a1)
             if module.orilinear.weight.requires_grad:
                 w_list.append(module.orilinear.weight)
 
@@ -211,7 +223,13 @@ def _prepare_stage2(qlayer, args):
         param.requires_grad = False
 
     fwt_modules = [module for _, module in qlayer.named_modules() if isinstance(module, FWTLinear)]
-    if "moe" in getattr(args, "net", "").lower():
+    is_grouped = any(isinstance(module, MoeSharedRotScale) for module in qlayer.modules())
+    is_moe = is_grouped or (
+        hasattr(qlayer, "mlp")
+        and hasattr(qlayer.mlp, "experts")
+        and isinstance(qlayer.mlp.experts, nn.ModuleList)
+    )
+    if is_moe:
         weights = []
         for module in fwt_modules:
             module.weight.requires_grad = True
@@ -261,6 +279,10 @@ def _prepare_stage2(qlayer, args):
             scale_params += _set_fwt_params_by_name(module, ["scale"])
             linear_params += _set_fwt_params_by_name(module, ["linear_"])
             a_params += _set_fwt_params_by_name(module, ["a1", "a2"])
+        if isinstance(module, MoeSharedRotScale):
+            a_params += _set_fwt_params_by_name(module, ["a1", "a2"])
+            if module.Trans is not None:
+                linear_params += _set_fwt_params_by_name(module.Trans, ["linear_"])
 
     param_groups = weight_groups + [
         {"params": scale_params, "lr": args.lw_lr / 5},
@@ -317,7 +339,10 @@ def _replace_tmp_with_fwt_structure(model, args, layer_group, expc_list=None):
     return model
 
 
-def _convert_stage2_group(qlayer, args, layer_group, expc_list=None, structure_only=False):
+def _convert_stage2_group(qlayer, args, layer_group, expc_list=None, structure_only=False, search_rank=None, search_world_size=None):
+    if any(isinstance(m, MoeSharedRotScale) for m in qlayer.modules()):
+        replace_TmpLinaer_with_FWTLinear_moe(qlayer, args, layer_group, expc_list, structure_only, search_rank, search_world_size)
+        return qlayer
     if structure_only:
         return _replace_tmp_with_fwt_structure(qlayer, args, layer_group, expc_list)
     if args.auto_mix_precision:
@@ -327,7 +352,7 @@ def _convert_stage2_group(qlayer, args, layer_group, expc_list=None, structure_o
     return qlayer
 
 
-def _convert_all_stage2_groups(qlayer, args, expc_list=None, structure_only=False):
+def _convert_all_stage2_groups(qlayer, args, expc_list=None, structure_only=False, search_rank=None, search_world_size=None):
     for layer_group in _stage2_layer_groups():
         qlayer = _convert_stage2_group(
             qlayer,
@@ -335,8 +360,42 @@ def _convert_all_stage2_groups(qlayer, args, expc_list=None, structure_only=Fals
             layer_group,
             expc_list,
             structure_only=structure_only,
+            search_rank=search_rank,
+            search_world_size=search_world_size,
         )
     return qlayer
+
+
+def _allgather_moe_search_results(qlayer, rank, world_size):
+    """Redistribute sharded MoE lattice-search results across ranks.
+
+    After a sharded Stage2 conversion, each rank holds the *real* searched
+    weights only for the experts it owns (``e % world_size == rank``); the rest
+    are placeholder null weights. Because the search is per-row and each rank
+    searched a disjoint set of experts, an all_gather of the per-expert
+    ``weight`` tensors (grouped by projection type so shapes match) recovers
+    the full searched weights on every rank. ``scale`` is deterministic
+    (``l2 * 2`` from the same pre-search weight), so it is identical across
+    ranks and needs no gather.
+    """
+    if world_size <= 1:
+        return
+
+    proj_types = ["gate_proj", "up_proj", "down_proj"]
+    for _, module in qlayer.named_modules():
+        if not _is_moe_block(module):
+            continue
+        num_experts = len(module.experts)
+        for p in proj_types:
+            fwts = [getattr(module.experts[e], p) for e in range(num_experts)]
+            if not all(isinstance(fwt, FWTLinear) for fwt in fwts):
+                continue
+            w = torch.stack([fwt.weight.data for fwt in fwts], dim=0)  # (E, oc, k)
+            gathered = [torch.empty_like(w) for _ in range(world_size)]
+            dist.all_gather(gathered, w)
+            for e in range(num_experts):
+                owner = e % world_size
+                fwts[e].weight.data.copy_(gathered[owner][e])
 
 
 def run_stage1_single(
@@ -421,7 +480,9 @@ def run_stage1_ddp_loop(
     dev = torch.device("cuda", local_rank)
     qlayer = qlayer.to(dev)
     optimizer = _prepare_stage1(qlayer, args)
-    qlayer = torch.nn.parallel.DistributedDataParallel(qlayer, device_ids=[local_rank])
+    # MoE sparse routing means some experts receive no token in a step, so their
+    # per-expert quantizer.alpha has no grad; allow unused params.
+    qlayer = torch.nn.parallel.DistributedDataParallel(qlayer, device_ids=[local_rank], find_unused_parameters=True)
     epochs = args.epochs1
     steps_per_epoch = args.nsamples1 // args.batch_size
     scheduler_list = _build_stage1_schedulers(optimizer, epochs, steps_per_epoch)
@@ -516,7 +577,9 @@ def _run_stage2_train_loop(
     dev = torch.device("cuda", local_rank)
     qlayer = qlayer.to(dev)
     optimizer = _prepare_stage2(qlayer, args)
-    qlayer = torch.nn.parallel.DistributedDataParallel(qlayer, device_ids=[local_rank])
+    # MoE sparse routing leaves some experts unused per step (their per-expert
+    # weight/scale receive no grad); allow unused params.
+    qlayer = torch.nn.parallel.DistributedDataParallel(qlayer, device_ids=[local_rank], find_unused_parameters=True)
     steps_per_epoch = samplenums // args.batch_size
     scheduler_list = _build_stage2_schedulers(optimizer, epochs * steps_per_epoch)
     loss_scaler = utils.NativeScalerWithGradNormCount()
@@ -794,6 +857,8 @@ def run_stage2_training(
         raise ValueError("--batch_size must be divisible by DDP world size for Stage2 DDP")
     if args.nsamples2 == args.nsamples:
         args.nsamples2 = args.nsamples2 - args.nsamples2 // 32
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
     qlayer = qlayer.to("cpu")
     torch.cuda.empty_cache()
     broadcast_training_command({"cmd": "stage2", "layer_idx": layer_idx, "nsamples2": args.nsamples2, "batch_size": args.batch_size, "expc_list": expc_list})
@@ -801,9 +866,11 @@ def run_stage2_training(
     dist.broadcast_object_list([(move_to_cpu(attention_mask), move_to_cpu(position_embeddings))], src=0)
     qlayer = qlayer.to(dev)
     print("start finetuning all weights")
-    qlayer = _convert_all_stage2_groups(qlayer, args, expc_list)
-    qlayer = qlayer.to("cpu")
-    dist.broadcast_object_list([qlayer.state_dict()], src=0)
+    # Sharded lattice search: each rank searches its own subset of experts, then
+    # all_gather redistributes the full searched weights. Removes the previous
+    # rank0-only search + broadcast (which serialized search on a single GPU).
+    qlayer = _convert_all_stage2_groups(qlayer, args, expc_list, search_rank=rank, search_world_size=world_size)
+    _allgather_moe_search_results(qlayer, rank, world_size)
     qlayer = _run_stage2_train_loop(
         qlayer,
         args,
@@ -825,6 +892,12 @@ def run_stage2_training(
 
 def _build_worker_qlayer(args, layer_idx):
     config = AutoConfig.from_pretrained(args.model, attn_implementation=args.attn_implementation)
+    if (
+        getattr(config, "model_type", "") == "qwen3_moe"
+        or any("moe" in (arch or "").lower() for arch in (getattr(config, "architectures", None) or []))
+    ):
+        from models.qwen3_moe_per_expert import patch_qwen3_moe_per_expert
+        patch_qwen3_moe_per_expert()
     with init_empty_weights():
         model = AutoModelForCausalLM.from_config(
             config=config,
@@ -833,7 +906,14 @@ def _build_worker_qlayer(args, layer_idx):
             attn_implementation=args.attn_implementation,
         )
     qlayer = model.model.layers[layer_idx]
-    replace_linear_with_TmpLinear(qlayer, args)
+    is_moe = (
+        getattr(config, "model_type", "") in ("qwen3_moe", "qwen2_moe")
+        or any("moe" in (arch or "").lower() for arch in (getattr(config, "architectures", None) or []))
+    )
+    if is_moe:
+        replace_linear_with_TmpLinear_moe(qlayer, args, getattr(args, "moe_num_groups", 1))
+    else:
+        replace_linear_with_TmpLinear(qlayer, args)
     del model
     return qlayer
 
@@ -889,11 +969,10 @@ def training_ddp_worker_loop(args):
                 qlayer,
                 args,
                 cmd.get("expc_list"),
-                structure_only=True,
+                search_rank=rank,
+                search_world_size=world_size,
             )
-            converted_state = [None]
-            dist.broadcast_object_list(converted_state, src=0)
-            qlayer.load_state_dict(converted_state[0], assign=True, strict=True)
+            _allgather_moe_search_results(qlayer, rank, world_size)
             trained = _run_stage2_train_loop(
                 qlayer,
                 args,

@@ -9,7 +9,7 @@ import utils
 import os
 import pdb
 import gc
-from quantize.utils import  get_parameters, get_act_means
+from quantize.utils import  get_parameters, get_act_means, get_moe_act_means
 from quantize.stage_training import null_traincast, run_stage1_training, run_stage2_training
 
 
@@ -92,6 +92,11 @@ def liftq(
     use_cache = model.config.use_cache
     #量化过程关闭cache
     model.config.use_cache = False
+    is_moe = (
+        'moe' in args.net.lower()
+        or getattr(model.config, 'model_type', '') in ('qwen3_moe', 'qwen2_moe')
+        or any('moe' in a.lower() for a in getattr(model.config, 'architectures', []))
+    )
     is_llama = False
     if args.info:
         print(args)
@@ -227,7 +232,9 @@ def liftq(
     
 
     #### Fuse parameters of RMSNorm and Rotation, abtain new model arch 
-    if 'qwen3.' not in args.net.lower():
+    if is_moe:
+        logger.info("=== Skip norm fusion for MoE (router gate must stay unfused) ===")
+    elif 'qwen3.' not in args.net.lower():
         logger.info(f"=== Start fuse nrom layers ===")
         fuse_indices = sorted(quant_layer_indices) if explicit_quant_layers else range(args.quant_end)
         for i in tqdm(fuse_indices):
@@ -273,9 +280,10 @@ def liftq(
         #if i==27:
         #    qlayer.to(float)
         if should_quantize:
-            if 'moe' in args.net.lower():
-                act_disturb = get_act_means(qlayer, fp_outs, 32, 4,['q_proj', 'o_proj', 'experts.0.up_proj', 'experts.1.up_proj'],attention_mask=attention_mask,position_embeddings=position_embeddings)
+            if is_moe:
+                act_disturb, moe_stats = get_moe_act_means(qlayer, fp_outs, 32, 4,['q_proj', 'o_proj'],attention_mask=attention_mask,position_embeddings=position_embeddings)
             else:
+                moe_stats = None
                 if any(name.endswith('q_proj') for name, _ in qlayer.named_modules()):
                     act_disturb = get_act_means(qlayer, fp_outs, 8, 4,['q_proj', 'o_proj', 'up_proj', 'down_proj'],attention_mask=attention_mask,position_embeddings=position_embeddings)
                 else:
@@ -313,6 +321,8 @@ def liftq(
                 print("Replacing")
                 if args.auto_mix_precision:
                     replace_linear_with_TmpLinear_mix(qlayer, args, expc_list)
+                elif is_moe:
+                    replace_linear_with_TmpLinear_moe(qlayer, args, getattr(args, 'moe_num_groups', 1))
                 else:
                     replace_linear_with_TmpLinear(qlayer, args)
                 qlayer.float() 
@@ -353,34 +363,29 @@ def liftq(
 
                     
                     
-                    if 'moe' in args.net.lower():
-                        
-                        tmp = ((act_disturb['experts.0.up_proj'].std(dim=0)/ act_disturb['experts.0.up_proj'].std()).to(qlayer.self_attn.q_proj.a1.data))
-                        tmp = torch.max(tmp, torch.tensor(1.).to(tmp))
-                        tmp = torch.min(tmp, torch.tensor(16.).to(tmp))
-                        non_finite_mask = ~torch.isfinite(tmp)
-                        indices = torch.nonzero(non_finite_mask)
-                        if indices.numel() > 0:
-                            tmp = ((act_disturb['experts.1.up_proj'].std(dim=0)/ act_disturb['experts.1.up_proj'].std()).to(qlayer.self_attn.q_proj.a1.data))
+                    if is_moe:
+                        mlp = qlayer.mlp
+                        num_experts = mlp.num_experts
+                        group_size = mlp.moe_group_size
+                        counts = moe_stats['counts']
+                        for g in range(len(mlp.moe_shared)):
+                            start = g * group_size
+                            end = min((g + 1) * group_size, num_experts)
+                            best_e = max(range(start, end), key=lambda e: counts[e].item())
+                            mask = (moe_stats['all_sel'] == best_e).any(dim=1)
+                            acts = moe_stats['all_in'][mask]
+                            tmp = (acts.std(dim=0) / acts.std()).to(qlayer.self_attn.q_proj.a1.data)
                             tmp = torch.max(tmp, torch.tensor(1.).to(tmp))
                             tmp = torch.min(tmp, torch.tensor(16.).to(tmp))
-                        non_finite_mask = ~torch.isfinite(tmp)
-                        indices = torch.nonzero(non_finite_mask)
-                        if indices.numel() > 0:
-                            print("setting 1")
-                            tmp.fill_(1.)
-                        expic = qlayer.mlp.experts[0].up_proj.expic
-                        tmp = F.pad(tmp, (0, expic - tmp.shape[-1]), mode="constant", value=1.)
-                        for name, module in  qlayer.named_modules():
-                            if (isinstance(module, TmpLinear)) and( ('up_proj' in name) or ('gate_proj' in name)):
-                                module.a1.data = tmp
-                        
-                        expic = qlayer.mlp.experts[0].down_proj.expic
-                        tmp = torch.ones(expic).to(qlayer.self_attn.q_proj.a1.data)*1.
-                        for name, module in  qlayer.named_modules():
-                            if (isinstance(module, TmpLinear)) and( ('down_proj' in name)):
-                                module.a1.data = tmp
-                            
+                            if not torch.isfinite(tmp).all():
+                                print("setting 1")
+                                tmp.fill_(1.)
+                            up_holder = mlp.moe_shared[g]['up_proj']
+                            tmp = F.pad(tmp, (0, up_holder.expic - tmp.shape[-1]), mode="constant", value=1.)
+                            tmp = tmp.reshape(up_holder.transdim1, up_holder.transdim2)
+                            mlp.moe_shared[g]['gate_proj'].a1.data = tmp
+                            mlp.moe_shared[g]['up_proj'].a1.data = tmp
+                            mlp.moe_shared[g]['down_proj'].a1.data = torch.ones_like(mlp.moe_shared[g]['down_proj'].a1.data)
                     else:
                         tmp = ((act_disturb['up_proj'].std(dim=0)/ act_disturb['up_proj'].std()).to(qlayer.mlp.up_proj.a1.data))
                         tmp = torch.max(tmp, torch.tensor(1.).to(tmp))
@@ -398,6 +403,8 @@ def liftq(
                         qlayer.mlp.down_proj.a1.data = tmp
                 
                 del act_disturb
+                if is_moe:
+                    del moe_stats
                 print("Done scale Init...")
             
             ###############################################################  

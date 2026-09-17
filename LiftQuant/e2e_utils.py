@@ -4,7 +4,8 @@ import torch
 from tqdm import tqdm
 import gc
 import re
-from quantize.tmplinear import TmpLinear, FWTLinear
+import os
+from quantize.tmplinear import TmpLinear, FWTLinear, make_fwtlinear_eval, build_moe_grouped_fwt_eval
 
 
 def resolve_torch_dtype(dtype):
@@ -20,6 +21,49 @@ def resolve_torch_dtype(dtype):
     if dtype not in dtype_map:
         raise ValueError(f"Unsupported dtype: {dtype}")
     return dtype_map[dtype]
+
+def _is_qwen3_moe(config):
+    """Return True when ``config`` describes a Qwen3-MoE architecture."""
+    model_type = getattr(config, "model_type", "") or ""
+    architectures = getattr(config, "architectures", None) or []
+    return model_type == "qwen3_moe" or any(
+        "moe" in (arch or "").lower() for arch in architectures
+    )
+
+
+def _get_moe_group_count(state_dict):
+    """Infer the number of shared rotation/scale groups from a grouped checkpoint."""
+    max_g = -1
+    for key in state_dict:
+        if "moe_shared." not in key:
+            continue
+        rest = key.split("moe_shared.", 1)[1]
+        try:
+            g = int(rest.split(".", 1)[0])
+        except ValueError:
+            continue
+        max_g = max(max_g, g)
+    return max_g + 1 if max_g >= 0 else 0
+
+
+def _peek_moe_group_count_per_layer(quant_model_path):
+    layer0_path = f"{quant_model_path}-layer0.pth"
+    if not os.path.exists(layer0_path):
+        return 0
+    state_dict = torch.load(layer0_path, map_location="cpu")
+    return _get_moe_group_count(state_dict)
+
+
+def _replace_moe_layer_for_eval(layer, wbits, expc, num_groups):
+    """Rebuild one MoE decoder layer into the grouped FWTLinear eval structure."""
+    # Attention projections stay dense (per-projection rotation/scale).
+    for name, module in get_named_linears(layer.self_attn, torch.nn.Linear).items():
+        with torch.no_grad():
+            fwt = make_fwtlinear_eval(module, wbits, expc, device="cpu", dtype=torch.float16)
+            set_op_by_name(layer.self_attn, name, fwt)
+    # MoE experts use group-shared rotation/scale.
+    build_moe_grouped_fwt_eval(layer.mlp, wbits, expc, num_groups, device="cpu", dtype=torch.float16)
+
 
 def get_named_linears(module, type):
     # return {name: m for name, m in module.named_modules() if isinstance(m, torch.nn.Linear)}
@@ -106,8 +150,28 @@ def load_quantized_model(fp_model_path, quant_model_path, wbits, expc, w_ternary
     # import pdb;pdb.set_trace()
     tokenizer = AutoTokenizer.from_pretrained(fp_model_path, use_fast=False)
     config = AutoConfig.from_pretrained(fp_model_path)
-    with init_empty_weights(): # 生成空的占位模型
-        model = AutoModelForCausalLM.from_config(config=config,torch_dtype=torch.float16, trust_remote_code=True)
+    is_moe = _is_qwen3_moe(config)
+    if is_moe:
+        from models.qwen3_moe_per_expert import patch_qwen3_moe_per_expert
+        patch_qwen3_moe_per_expert()
+    if load_per_layer:
+        # 逐层/部分量化：先加载完整 FP 权重，再只覆盖量化层（未量化层保持 FP）
+        model = AutoModelForCausalLM.from_pretrained(
+            fp_model_path, torch_dtype=torch.float16,
+            low_cpu_mem_usage=True, trust_remote_code=True)
+    else:
+        # 全量化（单 .pth）：保持 meta 空壳 + 整体加载（与现状一致，不额外加载 FP）
+        with init_empty_weights(): # 生成空的占位模型
+            model = AutoModelForCausalLM.from_config(config=config,torch_dtype=torch.float16, trust_remote_code=True)
+
+    num_groups = 1
+    if is_moe:
+        if state_dict is not None:
+            num_groups = _get_moe_group_count(state_dict)
+        else:
+            num_groups = _peek_moe_group_count_per_layer(quant_model_path)
+        num_groups = max(num_groups, 1)
+        print(f"Detected MoE shared group count: {num_groups}")
     #if load_per_layer:
     #    # 加载模型的非layer权重
     #    non_layer_state_dict = torch.load(quant_model_path+'-non_layer.pth', map_location="cpu")
@@ -118,29 +182,59 @@ def load_quantized_model(fp_model_path, quant_model_path, wbits, expc, w_ternary
     #    print(model.model.norm.weight)
     layers = model.model.layers
     expc_choice = None
-    if auto_mix_precision == True:
+    if auto_mix_precision:
+        num_layers = len(layers)
         if 'llama-3' in fp_model_path.lower():
-            expc_choice = [2, 2, 1, 2, 3, 3, 1, 3, 3, 2, 1, 2, 3, 3, 1, 2, 3, 3, 1, 2, 3, 3,
+            llama3_choice = [2, 2, 1, 2, 3, 3, 1, 3, 3, 2, 1, 2, 3, 3, 1, 2, 3, 3, 1, 2, 3, 3,
                                     1, 2, 2, 3, 1, 2, 2, 3, 1, 1, 1, 3, 1, 1, 2, 3, 1, 1, 1, 2, 1, 1,
                                     1, 2, 1, 1, 1, 2, 1, 1, 1, 2, 1, 1, 1, 2, 1, 1, 1, 2, 1, 2, 1, 2,
                                     1, 2, 1, 2, 1, 2, 1, 1, 1, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2,
                                     1, 1, 1, 2, 1, 1, 1, 1, 1, 1, 1, 1, 2, 1, 1, 1, 2, 1, 1, 1, 2, 2,
                                     1, 2, 2, 2, 1, 2, 3, 2, 1, 2, 3, 3, 2, 3, 3, 3, 3, 3]
+            if len(llama3_choice) == 4 * num_layers:
+                expc_choice = llama3_choice
+            else:
+                print(
+                    f"[e2e_utils] llama-3 auto_mix_precision schedule has {len(llama3_choice)} "
+                    f"entries but this model has {num_layers} layers (expects {4 * num_layers}); "
+                    "falling back to uniform expc."
+                )
         else:
-            expc_choice = [0, 0, 0, 0, 2, 2, 2, 2, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-       0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0,
-       0, 1, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 2, 0, 1, 0, 2, 0, 1, 0, 2,
-       0, 2, 0, 2, 0, 2, 0, 2, 1, 2, 0, 2, 1, 2, 0, 2, 1, 2, 0, 1, 1, 2,
-       0, 2, 1, 2, 0, 2, 1, 2, 0, 2, 1, 2, 0, 2, 1, 2, 0, 2, 1, 2, 0, 1,
-       1, 2, 1, 2, 2, 2, 0, 2, 2, 2, 0, 1, 2, 2, 1, 1, 2, 2]
-    layers_to_replace = range(len(layers)) if load_per_layer else quantized_layer_indices
+            print(
+                "[e2e_utils] auto_mix_precision has no per-layer schedule for this model family; "
+                "falling back to uniform expc."
+            )
+    if load_per_layer:
+        layers_to_replace = [
+            i for i in range(len(layers))
+            if os.path.exists(f'{quant_model_path}-layer{i}.pth')
+        ]
+        if not layers_to_replace:
+            raise ValueError(f"No per-layer LiftQuant checkpoints found for prefix {quant_model_path}")
+    else:
+        layers_to_replace = quantized_layer_indices
     invalid_layers = [i for i in layers_to_replace if i >= len(layers)]
     if invalid_layers:
         raise ValueError(
             f"Quantized layer indices {invalid_layers} exceed model layer count {len(layers)}"
         )
-    for i in tqdm(layers_to_replace):
+    # Split quantized layers into those that already have a dequantized FP cache
+    # (load directly, skipping the expensive FWTLinear rebuild + materialize) and
+    # those that still need the full pipeline.
+    if load_per_layer:
+        cached_layers = [
+            i for i in layers_to_replace
+            if os.path.exists(f'{quant_model_path}-layer{i}.dequant.pth')
+        ]
+        missing_layers = [i for i in layers_to_replace if i not in cached_layers]
+    else:
+        cached_layers = []
+        missing_layers = layers_to_replace
+    for i in tqdm(missing_layers):
         layer = layers[i]
+        if is_moe:
+            _replace_moe_layer_for_eval(layer, wbits, expc, num_groups)
+            continue
         named_linears = get_named_linears(layer, torch.nn.Linear)
         for name, module in named_linears.items():
 
@@ -195,16 +289,20 @@ def load_quantized_model(fp_model_path, quant_model_path, wbits, expc, w_ternary
     gc.collect()
     model.tie_weights()
     
-    device_map = infer_auto_device_map(model)
-    #print(model.model.layers[0].mlp.up_proj.Trans.linear_u_left.dtype)
+    # For layers that already have a dequantized FP cache, load it straight into
+    # the FP model's nn.Linear weights (no FWTLinear structure was built for them).
+    for i in cached_layers:
+        cache = torch.load(f'{quant_model_path}-layer{i}.dequant.pth', map_location='cpu')
+        model.load_state_dict(cache, assign=True, strict=False)
+    if cached_layers:
+        print(f"Loaded dequantized FP cache for {len(cached_layers)} layers.")
+    
     print("Loading pre-computed quantized weights...")
     
     if load_per_layer:
-        #1+1
-        # 加载模型的非layer权重
-        non_layer_state_dict = torch.load(quant_model_path+'-non_layer.pth', map_location="cpu")
-        model.load_state_dict(non_layer_state_dict, assign=True, strict=False)
-        for i in range(len(model.model.layers)):
+        # embed_tokens/norm/lm_head 已由 from_pretrained 加载（均为未量化 FP），无需 non_layer.pth；
+        # 只把「存在量化文件」的层覆盖成量化权重，其余层保持 FP。
+        for i in missing_layers:
             layer_path = f'{quant_model_path}-layer{i}.pth'
             state_dict = torch.load(layer_path, map_location="cpu")
             for key in list(state_dict.keys()):
@@ -223,16 +321,63 @@ def load_quantized_model(fp_model_path, quant_model_path, wbits, expc, w_ternary
 
     #check_meta_tensors(model)
 
-
-    model = dispatch_model(model, device_map=device_map)
-    print("Loaded quantized weights successfully.")
-
     target_dtype = resolve_torch_dtype(eval_dtype)
     # Evaluation should follow the same dtype choice as eval_by_lmeval.sh: the
     # caller passes float16/bfloat16/float32, while "auto" keeps the checkpoint
     # dtypes instead of forcing the LiftQuant model to float32.
     if target_dtype is not None:
         model = model.to(target_dtype)
+    # Pre-dequantize every FWTLinear once on CPU (before dispatch).  This is
+    # bit-identical to dequantizing on each forward (get_weight is a pure
+    # function) but avoids re-running unpack/scale/rotation per token.  Doing it
+    # before infer_auto_device_map/dispatch means (a) the transient dequant
+    # peak lives in host RAM (1TiB) instead of a single 80GB GPU, and (b) the
+    # device map is computed on the fully-materialized ~56GB model so it shards
+    # correctly instead of seeing only the ~31GB packed weights.
+    materialized = 0
+    if load_per_layer:
+        # Materialize per missing layer and immediately persist its dequantized
+        # FP weights, so even if dispatch/eval fails later we can reuse the cache.
+        for i in missing_layers:
+            with torch.no_grad():
+                for module in model.model.layers[i].modules():
+                    if isinstance(module, FWTLinear):
+                        module.materialize()
+                        materialized += 1
+            dequant = {}
+            for rel_name, module in model.model.layers[i].named_modules():
+                if isinstance(module, FWTLinear):
+                    dequant[f"model.layers.{i}.{rel_name}.weight"] = module._weight_fp.detach().cpu()
+                    if module.bias is not None:
+                        dequant[f"model.layers.{i}.{rel_name}.bias"] = module.bias.detach().cpu()
+            torch.save(dequant, f'{quant_model_path}-layer{i}.dequant.pth')
+    else:
+        with torch.no_grad():
+            for module in model.modules():
+                if isinstance(module, FWTLinear):
+                    module.materialize()
+                    materialized += 1
+    if materialized:
+        print(f"Materialized {materialized} quantized linear modules to FP cache.")
+
+    # Manually shard the ~57GB materialized model across GPUs at whole-layer
+    # granularity.  infer_auto_device_map's automatic balancing misbehaves on
+    # the per-expert MoE structure (it offloads modules to CPU even when they
+    # would fit), so we build a deterministic round-robin layer map instead.
+    num_gpus = torch.cuda.device_count()
+    num_layers = len(model.model.layers)
+    device_map = {}
+    for i in range(num_layers):
+        device_map[f"model.layers.{i}"] = i % num_gpus
+    device_map["model.embed_tokens"] = 0
+    device_map["model.norm"] = (num_layers - 1) % num_gpus
+    if hasattr(model.model, "rotary_emb"):
+        device_map["model.rotary_emb"] = 0
+    device_map["lm_head"] = (num_layers - 1) % num_gpus
+    model = dispatch_model(model, device_map=device_map)
+    print("Loaded quantized weights successfully.")
+    torch.cuda.empty_cache()
+    gc.collect()
     #load_checkpoint_in_model(model,checkpoint=model_path,device_map=device_map,offload_state_dict=True)
     #print("Loading pre-computed quantized weights Successfully")
     #print(model.model.layers[0].mlp.up_proj.Trans.linear_u_left.dtype)
