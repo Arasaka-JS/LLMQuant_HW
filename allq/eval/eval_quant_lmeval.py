@@ -108,7 +108,12 @@ def parse_args() -> argparse.Namespace:
         default=list(DEFAULT_TASKS),
         help="Comma-separated lm-eval tasks, or 'all' (default: all supported tasks)",
     )
-    parser.add_argument("--device", default="cuda:0", help="lm-eval device (default: %(default)s)")
+    parser.add_argument(
+        "--device",
+        default="auto",
+        help="Device for lm-eval: 'auto' follows the active accelerator "
+             "(cuda:0 on CUDA, npu:0 on Ascend); or pass cuda[:i] / npu[:i] / cpu explicitly.",
+    )
     parser.add_argument("--batch-size", default="auto:8")
     parser.add_argument("--max-batch-size", type=int, default=64)
     parser.add_argument("--dtype", default="auto", choices=("auto", "float16", "bfloat16", "float32"))
@@ -127,6 +132,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--w-ternary", default=None)
     parser.add_argument("--load-per-layer", action="store_true")
     parser.add_argument("--auto-mix-precision", action="store_true")
+    parser.add_argument(
+        "--fast-moe",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use the vectorized (sort+bmm) MoE expert forward instead of the "
+             "per-expert Python loop (default: true; use --no-fast-moe for A/B).",
+    )
+    parser.add_argument(
+        "--moe-sync-free-row-budget",
+        type=int,
+        default=0,
+        help="Padded-row budget for the sync-free MoE bucket (0 = always exact, "
+             "one host sync per layer; only short sequences profit from >0).",
+    )
     return parser.parse_args()
 
 
@@ -239,6 +258,8 @@ def build_liftquant_lm(args: argparse.Namespace):
             load_per_layer=args.load_per_layer,
             auto_mix_precision=args.auto_mix_precision,
             eval_dtype=args.dtype,
+            fast_moe=args.fast_moe,
+            moe_sync_free_row_budget=args.moe_sync_free_row_budget,
         )
     finally:
         os.chdir(previous_cwd)
@@ -323,6 +344,12 @@ def main() -> None:
     output_dir = args.output_dir.expanduser().resolve()
     tasks = args.tasks
 
+    # Follow the active accelerator unless the user pinned one explicitly.
+    sys.path.insert(0, str(project_root() / "LiftQuant"))
+    from device_utils import resolve as resolve_device
+
+    args.device = resolve_device(args.device)
+
     manifest = validate_common(data_dir)
     if args.backend == "liftquant":
         validate_hf_model_dir(args.fp_model_path, "FP model directory")
@@ -380,6 +407,10 @@ def main() -> None:
             "expc": args.expc if args.backend == "liftquant" else None,
             "load_per_layer": args.load_per_layer if args.backend == "liftquant" else None,
             "auto_mix_precision": args.auto_mix_precision if args.backend == "liftquant" else None,
+            "fast_moe": args.fast_moe if args.backend == "liftquant" else None,
+            "moe_sync_free_row_budget": (
+                args.moe_sync_free_row_budget if args.backend == "liftquant" else None
+            ),
             "dataset_manifest": manifest,
         },
         "summary": summary,

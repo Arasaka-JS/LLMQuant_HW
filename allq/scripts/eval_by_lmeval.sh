@@ -23,6 +23,11 @@ DATA_DIR="${DATA_DIR:-${PROJECT_ROOT}/datasets}"
 #   mmlu,lambada_openai,hellaswag,winogrande,piqa,truthfulqa_mc1,truthfulqa_mc2,openbookqa,boolq,rte,arc_easy,arc_challenge
 TASKS="${TASKS:-all}"
 CUDA_DEVICE="${CUDA_DEVICE:-2}"
+# EVAL_DEVICE selects the device passed to lm-eval.  'cuda:0' (default) keeps the
+# current CUDA behaviour; 'npu:0' runs on an Ascend NPU (the physical device is
+# selected via ASCEND_RT_VISIBLE_DEVICES below); 'auto' follows the active
+# accelerator.
+EVAL_DEVICE="${EVAL_DEVICE:-cuda:0}"
 EVAL_DTYPE="${EVAL_DTYPE:-bfloat16}"
 EVAL_BS="${EVAL_BS:-auto:8}"
 MAX_BATCH_SIZE="${MAX_BATCH_SIZE:-64}"
@@ -48,7 +53,7 @@ cmd=(
   --data-dir "${DATA_DIR}"
   --output-dir "${EVAL_RESULTS_DIR}"
   --tasks "${TASKS}"
-  --device cuda:0
+  --device "${EVAL_DEVICE}"
   --dtype "${EVAL_DTYPE}"
   --batch-size "${EVAL_BS}"
   --max-batch-size "${MAX_BATCH_SIZE}"
@@ -82,6 +87,19 @@ if [[ "${EVAL_BACKEND}" == "liftquant" && "${AUTO_MIX_PRECISION:-0}" == "1" ]]; 
   cmd+=(--auto-mix-precision)
 fi
 
+# FAST_MOE=0 switches the MoE expert forward back to the per-expert Python loop
+# (used for A/B comparison); FAST_MOE=1 (default) uses the vectorized sort+bmm
+# implementation.  MOE_SYNC_FREE_BUDGET=0 keeps the exact bucket (default).
+FAST_MOE="${FAST_MOE:-1}"
+if [[ "${EVAL_BACKEND}" == "liftquant" ]]; then
+  if [[ "${FAST_MOE}" == "0" ]]; then
+    cmd+=(--no-fast-moe)
+  else
+    cmd+=(--fast-moe)
+  fi
+  cmd+=(--moe-sync-free-row-budget "${MOE_SYNC_FREE_BUDGET:-0}")
+fi
+
 if [[ "${EVAL_BACKEND}" == "liftquant" && -n "${LIFTQUANT_W_TERNARY}" ]]; then
   cmd+=(--w-ternary "${LIFTQUANT_W_TERNARY}")
 fi
@@ -100,8 +118,10 @@ else
   printf '  Model:          %s\n' "${MODEL_PATH}"
 fi
 printf '  Tasks:          %s\n' "${TASKS}"
-printf '  Physical GPU:   %s (logical cuda:0)\n' "${CUDA_DEVICE}"
+printf '  Physical device: %s (logical %s)\n' "${CUDA_DEVICE}" "${EVAL_DEVICE}"
 printf '  Eval dtype:     %s\n' "${EVAL_DTYPE}"
+printf '  Fast MoE:       %s (1=vectorized sort+bmm, 0=per-expert loop)\n' "${FAST_MOE:-1}"
+printf '  MoE sync-free:  %s padded-row budget\n' "${MOE_SYNC_FREE_BUDGET:-0}"
 printf '  Batch size:     %s\n' "${EVAL_BS}"
 printf '  Max batch size: %s\n' "${MAX_BATCH_SIZE}"
 printf '  Example limit:  %s\n' "${LIMIT:-none (full evaluation)}"
@@ -111,4 +131,9 @@ printf 'Command:'
 printf ' %q' "${cmd[@]}"
 printf '\n\n'
 
-CUDA_VISIBLE_DEVICES="${CUDA_DEVICE}" "${cmd[@]}" 2>&1 | tee "${log_file}"
+# Select the physical accelerator that lm-eval's logical device refers to.
+if [[ "${EVAL_DEVICE}" == npu* ]]; then
+  ASCEND_RT_VISIBLE_DEVICES="${CUDA_DEVICE}" "${cmd[@]}" 2>&1 | tee "${log_file}"
+else
+  CUDA_VISIBLE_DEVICES="${CUDA_DEVICE}" "${cmd[@]}" 2>&1 | tee "${log_file}"
+fi

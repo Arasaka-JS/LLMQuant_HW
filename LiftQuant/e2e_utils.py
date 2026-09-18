@@ -6,6 +6,8 @@ import gc
 import re
 import os
 from quantize.tmplinear import TmpLinear, FWTLinear, make_fwtlinear_eval, build_moe_grouped_fwt_eval
+from models.moe_fast_eval import convert_moe_blocks_to_fast, SYNC_FREE_ROW_BUDGET as MOE_SYNC_FREE_BUDGET
+from device_utils import device_count, empty_cache
 
 
 def resolve_torch_dtype(dtype):
@@ -130,7 +132,7 @@ def check_meta_tensors(model, context: str = "当前状态"):
 
     return found_meta_tensor
 
-def load_quantized_model(fp_model_path, quant_model_path, wbits, expc, w_ternary, load_per_layer, auto_mix_precision = False, eval_dtype = "float32"):
+def load_quantized_model(fp_model_path, quant_model_path, wbits, expc, w_ternary, load_per_layer, auto_mix_precision = False, eval_dtype = "float32", fast_moe = True, moe_sync_free_row_budget = MOE_SYNC_FREE_BUDGET):
     print(f"Loading quantized model from {fp_model_path}")
 
     state_dict = None
@@ -285,7 +287,7 @@ def load_quantized_model(fp_model_path, quant_model_path, wbits, expc, w_ternary
 
         #print(model.model.layers[0].mlp.up_proj.Trans.linear_u_left.dtype)
     #print(model.model.layers[0].mlp.up_proj.Trans.linear_u_left.dtype)
-    torch.cuda.empty_cache()
+    empty_cache()
     gc.collect()
     model.tie_weights()
     
@@ -351,12 +353,30 @@ def load_quantized_model(fp_model_path, quant_model_path, wbits, expc, w_ternary
                     if module.bias is not None:
                         dequant[f"model.layers.{i}.{rel_name}.bias"] = module.bias.detach().cpu()
             torch.save(dequant, f'{quant_model_path}-layer{i}.dequant.pth')
+            if fast_moe:
+                # Swap the per-expert MoE blocks of this layer for the vectorized
+                # fused implementation.  Done after the dequant cache write (which
+                # reads `_weight_fp`) and before dispatch, so the fused buffers are
+                # moved to the right devices together with the rest of the layer.
+                converted = convert_moe_blocks_to_fast(
+                    model.model.layers[i], dtype=target_dtype,
+                    sync_free_row_budget=moe_sync_free_row_budget,
+                )
+                if converted:
+                    print(f"[fast_moe] layer {i}: fused {len(converted)} MoE block(s)")
     else:
         with torch.no_grad():
             for module in model.modules():
                 if isinstance(module, FWTLinear):
                     module.materialize()
                     materialized += 1
+        if fast_moe:
+            converted = convert_moe_blocks_to_fast(
+                model, dtype=target_dtype, sync_free_row_budget=moe_sync_free_row_budget,
+            )
+            if converted:
+                print(f"[fast_moe] fused {len(converted)} MoE block(s): "
+                      f"vectorized sort+bmm expert forward")
     if materialized:
         print(f"Materialized {materialized} quantized linear modules to FP cache.")
 
@@ -364,7 +384,7 @@ def load_quantized_model(fp_model_path, quant_model_path, wbits, expc, w_ternary
     # granularity.  infer_auto_device_map's automatic balancing misbehaves on
     # the per-expert MoE structure (it offloads modules to CPU even when they
     # would fit), so we build a deterministic round-robin layer map instead.
-    num_gpus = torch.cuda.device_count()
+    num_gpus = device_count() or 1
     num_layers = len(model.model.layers)
     device_map = {}
     for i in range(num_layers):
@@ -376,7 +396,7 @@ def load_quantized_model(fp_model_path, quant_model_path, wbits, expc, w_ternary
     device_map["lm_head"] = (num_layers - 1) % num_gpus
     model = dispatch_model(model, device_map=device_map)
     print("Loaded quantized weights successfully.")
-    torch.cuda.empty_cache()
+    empty_cache()
     gc.collect()
     #load_checkpoint_in_model(model,checkpoint=model_path,device_map=device_map,offload_state_dict=True)
     #print("Loading pre-computed quantized weights Successfully")

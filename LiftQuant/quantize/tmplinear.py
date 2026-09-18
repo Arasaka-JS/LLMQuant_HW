@@ -526,8 +526,8 @@ class FWTLinear(nn.Module):
         return F.linear(x, weight[:, :self.ic].to(x), self.bias)
 
     @torch.no_grad()
-    def materialize(self):
-        """Pre-dequantize the packed weight once and cache it as an FP buffer.
+    def materialize(self, dtype=None):
+        """Pre-dequantize the packed weight once and cache it as a buffer.
 
         ``get_weight()`` is a pure function (packed bits -> scale -> rotation ->
         reshape -> a1), so caching its output is bit-identical to recomputing it
@@ -535,11 +535,32 @@ class FWTLinear(nn.Module):
         evaluation (especially for MoE, where top-k experts are re-dequantized
         per token).  The quantization-only storage (``packed_weight``/``scale``)
         is released to keep peak memory near the FP baseline.
+
+        ``dtype`` casts the cached weight to the evaluation dtype **once**.
+        Without it the raw ``get_weight()`` output stays float32
+        (``unpack_bits_uint8`` returns uint8 and ``uint8 - 0.5`` promotes to
+        float32 regardless of the module dtype), which made ``forward()``
+        re-cast the whole weight matrix on every call (an O(weight) cost paid
+        per routed MoE expert per forward) and doubled the resident weight
+        memory.  The dequantization math itself is untouched: it still runs in
+        float32 and is only cast at the end, exactly like the plain-``nn.Linear``
+        path that loads a ``*.dequant.pth`` cache.
         """
         if hasattr(self, '_weight_fp'):
             return self
-        weight_fp = self.get_weight()[:, :self.ic].contiguous()
-        self.register_buffer('_weight_fp', weight_fp, persistent=False)
+        if dtype is None:
+            # After ``model.to(target_dtype)`` these already hold the evaluation
+            # dtype, so the cached weight matches the activations.
+            if 'scale' in self._parameters:
+                dtype = self._parameters['scale'].dtype
+            elif 'weight' in self._parameters:
+                dtype = self._parameters['weight'].dtype
+            else:
+                dtype = torch.float32
+        weight_fp = self.get_weight()[:, :self.ic]
+        if weight_fp.dtype != dtype:
+            weight_fp = weight_fp.to(dtype)
+        self.register_buffer('_weight_fp', weight_fp.contiguous(), persistent=False)
         for name in ('packed_weight',):
             if name in self._buffers:
                 del self._buffers[name]
